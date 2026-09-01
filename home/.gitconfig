@@ -1,0 +1,14 @@
+[user]
+        name = Phillip McMahon
+        email = phillip.mcmahon@gmail.com
+        signingkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ9NhNfTFUgLmhp+JEP/6oI5PLs+8wM1fxltSoLcwIip bw-managed-key
+[gpg]
+        format = ssh
+[gpg "ssh"]
+        allowedSignersFile = ~/.config/git/allowed_signers
+[init]
+        defaultBranch = main
+[commit]
+        gpgsign = true
+[pull]
+        rebase = true

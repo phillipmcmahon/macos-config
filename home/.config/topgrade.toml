@@ -1,0 +1,7 @@
+# topgrade configuration
+# Only non-default settings are kept here.
+# See: https://github.com/topgrade-rs/topgrade/wiki/Configuration
+
+[misc]
+# Run cleanup steps after updates
+cleanup = true

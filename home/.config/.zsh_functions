@@ -1,0 +1,1286 @@
+# ============================================================================
+# zsh function library - v2.17
+#
+# v2.17:
+#   - sshmount(): verifies the mount actually established after sshfs
+#     returns. sshfs can exit 0 even when the backgrounded mount fails to
+#     come up, leaving a stale empty mountpoint and a misleading success
+#     message. macOS ships no `mountpoint` utility, so the check greps the
+#     mount table (`mount | grep -qF " on <path> "`). On verification
+#     failure the created mountpoint directory is removed as before.
+#
+# v2.16:
+#   - encrypt(): the plaintext zip archive is now staged in ${TMPDIR:-/tmp}
+#     rather than in a temporary directory beside the output. On SMB mounts
+#     'rm -rf' can return success without unlinking, so an archive staged on
+#     the share was left behind on every invocation - an unencrypted copy of
+#     the entire source tree, accumulating one directory per run. TMPDIR is
+#     local and honours removal. _gpg_publish()'s temporary directory still
+#     lives beside the output, because the hard-link publish requires the
+#     same filesystem, and that one is removed successfully.
+#
+# v2.15:
+#   - encrypt() / _gpg_publish(): EXIT-trap cleanup now expands and quotes
+#     the temporary path at trap-set time. zsh pops a function's local scope
+#     before running its EXIT trap, so the previous single-quoted '$var'
+#     expanded to empty and silently cleaned up nothing, leaving temporary
+#     directories behind with no warning
+#   - encrypt(): removes the plaintext archive directory explicitly on the
+#     success path and disarms the EXIT trap once it is gone
+#   - _gpg_publish(): success path now disarms the EXIT trap as well; the
+#     previous temp_dir="" no longer suppresses it
+#   - _archive_dir(): Info-ZIP rejects '--' ("can't use -- before archive
+#     name"), so it is omitted. Option/operand ambiguity is handled by
+#     construction instead: the archive path is always absolute (mktemp -d)
+#     and the source operand is ./-prefixed so a directory name beginning
+#     with '-' cannot be parsed as a flag
+#
+# v2.14:
+#   - encrypt(): now accepts a directory as well as a regular file. A
+#     directory is archived with zip into a private mode-0700 temporary
+#     directory and encrypted from there, so no intermediate .zip is ever
+#     written next to the original and no namespace collision is possible.
+#     Output is <dir>.zip.<timestamp>.asc, so decrypt() restores <dir>.zip.
+#     Requires zip only when a directory is passed.
+#   - _archive_dir(): new internal helper wrapping the zip invocation
+#     (stored paths are relative to the parent directory, so extraction
+#     recreates the directory itself rather than an absolute path chain)
+#
+# v2.13:
+#   - decrypt(): unrecognised file extensions now fail immediately with a
+#     descriptive message listing accepted extensions, instead of falling
+#     through to a misleading "won't overwrite input" error
+#   - entropy(): output now includes a " bits" label and is formatted to
+#     two decimal places (e.g. "131.09 bits")
+#   - blastem: added APFS copy-on-write limitation note (rm/shred do not
+#     guarantee physical erasure; FileVault is the real control)
+#
+# v2.12:
+#   - openpgpkey_lookup_validate: detect GNU vs BSD base64 automatically
+#     (GNU uses -d, BSD uses -D) so the function works regardless of whether
+#     coreutils gnubin is on PATH
+#   - e() renamed to entropy() to avoid PATH/alias collisions
+#
+# v2.11:
+#   - openpgpkey_lookup: normalise OPENPGPKEY RDATA to a single Base64 line
+#     and enable pipefail so dig failures are still propagated
+#   - openpgpkey_lookup_validate: consume the normalised lookup output directly
+#
+# v2.10:
+#   - openpgpkey_lookup_validate: decode and validate OPENPGPKEY DNS key
+#     material, then confirm each primary key is present in the local GPG
+#     keyring; requires base64, gpg, mktemp, and awk in addition to the
+#     openpgpkey_lookup dependencies
+#
+# v2.9:
+#   - openpgpkey_lookup: look up an OPENPGPKEY DNS record for an email
+#     address; local-part is lowercased and hashed with SHA-256 (first 56
+#     hex characters) per RFC 7929; requires dig and sha256sum
+#
+# v2.8:
+#   - _gpg_publish: falls back to an O_EXCL noclobber copy when hard links
+#     are unsupported (SMB, exFAT); no-overwrite guarantee preserved
+#
+# v2.7:
+#   - generate_modhex / generate_modhex_bulk: numeric arguments are converted
+#     with an explicit 10# base so leading zeros can never be re-interpreted
+#   - _gpg_publish: requires at least one GPG option after the fixed
+#     arguments; chmod/ln deliberately omit -- (unsupported by BSD versions;
+#     operands are always absolute paths)
+#   - verify-sig: rejects more than two arguments with a usage error
+#   - release_card: comment clarifies that component termination failures are
+#     not propagated but missing dependencies still fail
+#   - myip: rejects carriage returns instead of silently removing them
+# ============================================================================
+
+# --- Overridable defaults ---------------------------------------------------
+# GPG_ENCRYPT_KEY may be a full fingerprint, long key ID, or another selector
+# that resolves to exactly one public key in the local GPG keyring. encrypt()
+# resolves it to the full primary-key fingerprint before use.
+: ${GPG_ENCRYPT_KEY:=0xA11E70ADFDA60CF9}
+
+# Space-separated NAS interface MAC addresses for Wake-on-LAN.
+: ${NAS_MACS:="00:11:32:e8:b5:92 00:11:32:e8:b5:93 00:11:32:e8:b5:94"}
+
+# zcalc is supplied by the standard zsh function collection.
+autoload -Uz zcalc
+
+# ============================================================================
+# Internal helpers
+# ============================================================================
+
+# _archive_dir <directory> <archive-path>
+# Create a zip archive of <directory> at <archive-path>.
+#
+# The archive path must not already exist; the caller is expected to supply a
+# path inside a private temporary directory, which is why this helper does not
+# repeat _gpg_publish's link/noclobber publishing dance.
+#
+# zip is run from the parent directory with the basename as its only operand,
+# so stored paths are relative and extraction recreates the directory itself
+# rather than a chain of leading components. -X drops extra file attributes
+# (uid/gid, mac extra fields) that would otherwise leak host metadata into
+# the ciphertext. Empty directories are preserved (zip stores them by default
+# with -r); symbolic links are stored as links (-y) rather than followed, so
+# a link pointing outside the tree cannot silently pull in unrelated data.
+_archive_dir() {
+    emulate -L zsh
+
+    _require "$1" "directory" || return 1
+    _require "$2" "archive-path" || return 1
+    _require_cmd zip || return 1
+
+    local source="${1%/}"
+    local archive="$2"
+
+    [[ -d "$source" && ! -L "$source" ]] || {
+        echo "not a directory: $1" >&2
+        return 1
+    }
+
+    local parent="${source:h:A}"
+    local base="${source:t}"
+
+    [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || {
+        echo "cannot archive: $1" >&2
+        return 1
+    }
+
+    [[ -d "$parent" ]] || {
+        echo "parent directory does not exist: $parent" >&2
+        return 1
+    }
+
+    if _path_exists "$archive"; then
+        echo "refusing to overwrite existing archive: $archive" >&2
+        return 1
+    fi
+
+    # A subshell keeps the cd local; the caller's working directory is
+    # untouched even if zip fails.
+    #
+    # Info-ZIP's zip rejects '--' outright ("can't use -- before archive
+    # name"), so option/operand ambiguity is handled by construction instead:
+    # $archive is always absolute (it comes from a mktemp -d path), and the
+    # source operand is prefixed with ./ so a directory whose name begins
+    # with '-' can never be parsed as a flag.
+    (
+        cd -- "$parent" || exit 1
+        command zip -r -q -X -y "$archive" "./$base"
+    ) || {
+        echo "could not create archive of: $1" >&2
+        return 1
+    }
+}
+
+# _require <value> <label>
+# Fail with a usage message when a required argument is missing.
+_require() {
+    emulate -L zsh
+    [[ -n "${1-}" ]] || {
+        echo "usage: ${funcstack[2]} - missing: ${2:-<arg>}" >&2
+        return 1
+    }
+}
+
+# _require_cmd <command>
+# Fail with a clear error when a required executable is unavailable.
+_require_cmd() {
+    emulate -L zsh
+    [[ -n "${1-}" ]] || {
+        echo "_require_cmd: missing command name" >&2
+        return 1
+    }
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "required command not found: $1" >&2
+        return 1
+    }
+}
+
+# _path_exists <path>
+# Treat dangling symbolic links as existing paths for overwrite protection.
+_path_exists() {
+    emulate -L zsh
+    [[ -e "$1" || -L "$1" ]]
+}
+
+# _modhex
+# Filter: translate hexadecimal on stdin to Modhex on stdout. The translation
+# table lives only here. Callers are responsible for verifying tr is
+# available (_require_cmd tr); this helper does not repeat the check.
+_modhex() {
+    emulate -L zsh
+    command tr '0123456789abcdef' 'cbdefghijklnrtuv'
+}
+
+# _resolve_gpg_recipient <selector>
+# Resolve a key selector to exactly one full primary-key fingerprint.
+_resolve_gpg_recipient() {
+    emulate -L zsh
+    setopt extendedglob
+    _require "$1" "GPG recipient" || return 1
+    _require_cmd gpg || return 1
+    _require_cmd awk || return 1
+
+    local listing fingerprints fingerprint
+    listing="$(command gpg --batch --with-colons --list-keys -- "$1" 2>/dev/null)" || {
+        echo "GPG recipient not found: $1" >&2
+        return 1
+    }
+
+    fingerprints="$(
+        print -r -- "$listing" | command awk -F: '
+            $1 == "pub" { want_fingerprint = 1; next }
+            want_fingerprint && $1 == "fpr" {
+                print $10
+                want_fingerprint = 0
+            }
+        '
+    )"
+
+    [[ -n "$fingerprints" ]] || {
+        echo "could not resolve a primary-key fingerprint for: $1" >&2
+        return 1
+    }
+
+    if [[ "$fingerprints" == *$'\n'* ]]; then
+        echo "GPG recipient selector is ambiguous: $1" >&2
+        return 1
+    fi
+
+    fingerprint="$fingerprints"
+    [[ "$fingerprint" == [[:xdigit:]](#c40) || "$fingerprint" == [[:xdigit:]](#c64) ]] || {
+        echo "GPG returned an invalid fingerprint for: $1" >&2
+        return 1
+    }
+
+    print -r -- "$fingerprint"
+}
+
+# _gpg_publish <input> <output> <label> <gpg-args...>
+# Shared machinery for encrypt, decrypt, and sign: run GPG writing into a
+# private mode-0700 temporary directory next to the destination, then publish
+# the mode-0600 result without overwriting files or symbolic links.
+#
+# mktemp -d creates the temporary directory with mode 0700 regardless of the
+# umask, and the output file is chmod'd 600 explicitly, so this function never
+# modifies the calling shell's umask.
+#
+# Only the parent directory is canonicalised; the output's own name is kept
+# as-is so that a symbolic link (including a dangling one) at the output name
+# is detected rather than followed to its target.
+#
+# Cleanup uses the EXIT trap only. In zsh, a function's EXIT trap also fires
+# when a signal interrupts the function, and because this library is sourced,
+# re-raising a signal at $$ would kill the interactive shell.
+#
+# Publishing prefers a hard link, which fails atomically if the target
+# already exists (including a dangling symbolic link). On filesystems that do
+# not support hard links (SMB, exFAT, certain network mounts) it falls back
+# to an O_EXCL exclusive create via a noclobber redirection, which still
+# guarantees no overwrite, although the content copy itself is not atomic.
+_gpg_publish() {
+    emulate -L zsh
+    setopt localtraps
+
+    _require "$1" "input" || return 1
+    _require "$2" "output" || return 1
+    _require "$3" "label" || return 1
+    _require_cmd gpg || return 1
+    _require_cmd mktemp || return 1
+
+    local input="$1" output="$2" label="$3"
+    shift 3
+
+    (( $# >= 1 )) || {
+        echo "_gpg_publish: missing GPG options" >&2
+        return 1
+    }
+
+    local output_dir="${output:h:A}"
+    local output_name="${output:t}"
+    local output_path="${output_dir}/${output_name}"
+
+    [[ -d "$output_dir" ]] || {
+        echo "output directory does not exist: $output_dir" >&2
+        return 1
+    }
+
+    if _path_exists "$output_path"; then
+        echo "refusing to overwrite existing: $output" >&2
+        return 1
+    fi
+
+    local temp_dir tmp
+    temp_dir="$(command mktemp -d "${output_dir}/.${output_name}.tmp.XXXXXX")" || {
+        echo "could not create temporary directory in: $output_dir" >&2
+        return 1
+    }
+    tmp="$temp_dir/output"
+
+    trap "command rm -rf -- ${(q)temp_dir} 2>/dev/null \
+        || echo 'warning: temporary data remains: ${temp_dir}' >&2" EXIT
+
+    command gpg "$@" --output "$tmp" -- "$input" || {
+        echo "$label failed: $input" >&2
+        return 1
+    }
+
+    [[ -f "$tmp" ]] || {
+        echo "$label produced no regular output file: $input" >&2
+        return 1
+    }
+
+    # BSD chmod/ln (macOS) do not support --. Safe without it: both operands
+    # are derived from ${output:h:A} and therefore always absolute paths.
+    command chmod 600 "$tmp" || {
+        echo "could not secure temporary output: $tmp" >&2
+        return 1
+    }
+
+    # Publish without overwriting. Preferred path: a hard link, which fails
+    # atomically if the target exists. Some filesystems (SMB, exFAT) do not
+    # support hard links; fall back to an O_EXCL exclusive create via a
+    # noclobber redirection, which still guarantees no overwrite. The
+    # fallback's content copy is not atomic, so a partial file is removed on
+    # copy failure (safe: the O_EXCL create proved this invocation created
+    # it). chmod on the final file is best-effort because network mounts
+    # often ignore or reject POSIX mode changes.
+    if ! command ln "$tmp" "$output_path" 2>/dev/null; then
+        setopt localoptions noclobber
+        if ! command cat -- "$tmp" > "$output_path" 2>/dev/null; then
+            echo "could not create final output without overwrite: $output" >&2
+            return 1
+        fi
+        if [[ ! -s "$output_path" && -s "$tmp" ]]; then
+            command rm -f -- "$output_path"
+            echo "copy to final output failed: $output" >&2
+            return 1
+        fi
+        command chmod 600 "$output_path" 2>/dev/null
+    fi
+
+    # The output is committed; leftover temporary data is only worth a
+    # warning. On success temp_dir is cleared so the EXIT trap does nothing;
+    # on failure it is left set so the trap retries the removal.
+    if command rm -rf -- "$temp_dir" 2>/dev/null; then
+        temp_dir=""
+        trap - EXIT
+    else
+        echo "warning: output was created, but temporary data remains: $temp_dir" >&2
+    fi
+
+    echo "$input -> $output"
+}
+
+# ============================================================================
+# Navigation
+# ============================================================================
+# Tip: setopt auto_cd in .zshrc makes bare .. and ../.. work natively.
+
+..() {
+    cd ..
+}
+
+...() {
+    cd ../..
+}
+
+....() {
+    cd ../../..
+}
+
+# ============================================================================
+# GPG / Crypto
+# ============================================================================
+
+# encrypt <file|directory>
+# Encrypt to an armoured, timestamped .asc file alongside the original.
+#
+# A regular file is encrypted directly, producing <file>.<timestamp>.asc.
+# A directory is first archived with zip, producing <dir>.zip.<timestamp>.asc.
+# The intermediate archive is written into a private mode-0700 temporary
+# directory under ${TMPDIR:-/tmp} and removed afterwards, so it never appears
+# in the working directory, never lands on a network share, and cannot
+# collide with, or be mistaken for, an existing file. Both output shapes end
+# in .<timestamp>.asc, so decrypt() restores them without special-casing.
+encrypt() {
+    emulate -L zsh
+    setopt localtraps
+
+    _require "$1" "file or directory" || return 1
+
+    local recipient
+    local target="${1%/}"
+    local stamp
+
+    if [[ -f "$1" ]]; then
+        recipient="$(_resolve_gpg_recipient "$GPG_ENCRYPT_KEY")" || return 1
+
+        _gpg_publish "$1" "${1}.$(date +%Y%m%d-%H%M%S%z).asc" encryption \
+            --encrypt --armor --recipient "$recipient"
+        return
+    fi
+
+    [[ -d "$target" && ! -L "$target" ]] || {
+        echo "no such regular file or directory: $1" >&2
+        return 1
+    }
+
+    _require_cmd zip || return 1
+    _require_cmd mktemp || return 1
+
+    recipient="$(_resolve_gpg_recipient "$GPG_ENCRYPT_KEY")" || return 1
+
+    local parent="${target:h:A}"
+    local base="${target:t}"
+
+    [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || {
+        echo "cannot encrypt: $1" >&2
+        return 1
+    }
+
+    stamp="$(date +%Y%m%d-%H%M%S%z)" || return 1
+    local output="${parent}/${base}.zip.${stamp}.asc"
+
+    if _path_exists "$output"; then
+        echo "refusing to overwrite existing: $output" >&2
+        return 1
+    fi
+
+    # The plaintext archive is created in the local temporary directory, not
+    # next to the destination. On this SMB mount 'rm -rf' returns success
+    # without actually unlinking the directory, so an archive staged on the
+    # share survives every attempt to clean it up and leaves an unencrypted
+    # copy of the whole tree behind on each run. TMPDIR is local, private,
+    # and honours removal. mktemp -d gives mode 0700 regardless of umask, so
+    # the plaintext is never readable by other users while it exists.
+    local archive_dir
+    archive_dir="$(command mktemp -d "${TMPDIR:-/tmp}/encrypt.zip.tmp.XXXXXX")" || {
+        echo "could not create temporary directory in: ${TMPDIR:-/tmp}" >&2
+        return 1
+    }
+
+    # Cleanup is via the EXIT trap only: in zsh a function's EXIT trap also
+    # fires when a signal interrupts it, and re-raising at $$ would kill this
+    # interactive shell. The path is expanded and quoted NOW, at trap-set
+    # time, rather than left as a live reference: zsh pops the function's
+    # local scope before running the EXIT trap, so a '$archive_dir' inside
+    # single quotes would expand to nothing and clean up nothing at all.
+    trap "command rm -rf -- ${(q)archive_dir} 2>/dev/null \
+        || echo 'warning: plaintext archive may remain: ${archive_dir}' >&2" EXIT
+
+    local archive="${archive_dir}/${base}.zip"
+
+    _archive_dir "$target" "$archive" || return 1
+    command chmod 600 "$archive" 2>/dev/null
+
+    _gpg_publish "$archive" "$output" encryption \
+        --encrypt --armor --recipient "$recipient" >/dev/null || return 1
+
+    # The ciphertext is committed; remove the plaintext archive immediately
+    # rather than waiting for the trap, and disarm the trap once it is gone.
+    if command rm -rf -- "$archive_dir" 2>/dev/null; then
+        trap - EXIT
+    else
+        echo "warning: ciphertext written, but plaintext archive remains: $archive_dir" >&2
+    fi
+
+    echo "$1 -> $output"
+}
+
+# decrypt <file>
+# Decrypt a .asc, .gpg, .pgp, or timestamped .<timestamp>.asc file.
+# Plaintext is written to a mode-0600 temporary file in the destination
+# directory. The final path is created only after successful decryption.
+decrypt() {
+    emulate -L zsh
+    setopt extendedglob
+
+    _require "$1" "file" || return 1
+
+    [[ -f "$1" ]] || {
+        echo "no such regular file: $1" >&2
+        return 1
+    }
+
+    local output="$1"
+
+    if [[ "$1" == (#b)(*).[0-9](#c8)-[0-9](#c6)[+-][0-9](#c4).asc ]]; then
+        output="$match[1]"
+    else
+        case "$1" in
+            *.gpg)
+                output="${1%.gpg}"
+                ;;
+            *.asc)
+                output="${1%.asc}"
+                ;;
+            *.pgp)
+                output="${1%.pgp}"
+                ;;
+            *)
+                echo "cannot derive plaintext filename from: $1" >&2
+                echo "  (expected .gpg, .asc, .pgp, or a timestamped .YYYYMMDD-HHMMSSz.asc extension)" >&2
+                return 1
+                ;;
+        esac
+    fi
+
+    [[ -n "$output" ]] || {
+        echo "cannot derive output name from: $1" >&2
+        return 1
+    }
+
+    [[ "$output" != "$1" ]] || {
+        echo "won't overwrite input: $1" >&2
+        return 1
+    }
+
+    _gpg_publish "$1" "$output" decryption --decrypt
+}
+
+# sign <file>
+# Create a detached armoured signature as file.sig.
+sign() {
+    emulate -L zsh
+    _require "$1" "file" || return 1
+
+    [[ -f "$1" ]] || {
+        echo "no such regular file: $1" >&2
+        return 1
+    }
+
+    _gpg_publish "$1" "${1}.sig" signing --armor --detach-sig
+}
+
+# verify-sig <signature> [source]
+# Verify a detached signature. Without an explicit source, the signature must
+# end in .sig and the source is derived by stripping that suffix. With an
+# explicit source, any signature filename is accepted. encrypt() produces
+# .asc ciphertext, so .asc is never treated as a signature implicitly.
+verify-sig() {
+    emulate -L zsh
+    _require "$1" "sig-file" || return 1
+    _require_cmd gpg || return 1
+
+    (( $# <= 2 )) || {
+        echo "usage: verify-sig <signature> [source]" >&2
+        return 1
+    }
+
+    [[ -f "$1" ]] || {
+        echo "signature file not found: $1" >&2
+        return 1
+    }
+
+    local src
+    if [[ -n "${2-}" ]]; then
+        src="$2"
+    else
+        [[ "$1" == *.sig ]] || {
+            echo "expected a .sig file (or pass the source file explicitly)" >&2
+            return 1
+        }
+        src="${1%.sig}"
+        [[ -n "$src" ]] || {
+            echo "cannot derive source file from: $1" >&2
+            return 1
+        }
+    fi
+
+    [[ -f "$src" ]] || {
+        echo "source file not found: $src" >&2
+        return 1
+    }
+
+    command gpg --verify -- "$1" "$src"
+}
+
+# verify-dec <file>
+# Test that an encrypted file decrypts without writing plaintext to disk.
+verify-dec() {
+    emulate -L zsh
+    _require "$1" "file" || return 1
+    _require_cmd gpg || return 1
+
+    [[ -f "$1" ]] || {
+        echo "encrypted file not found: $1" >&2
+        return 1
+    }
+
+    if command gpg --quiet --decrypt -- "$1" >/dev/null; then
+        echo "$1: OK (decrypts successfully)"
+    else
+        echo "$1: FAILED to decrypt" >&2
+        return 1
+    fi
+}
+
+# rgpg
+# Restart gpg-agent.
+rgpg() {
+    emulate -L zsh
+    _require_cmd gpg-connect-agent || return 1
+
+    command gpg-connect-agent killagent /bye 2>/dev/null || true
+    command gpg-connect-agent /bye
+}
+
+# release_card
+# Best-effort cleanup: kill scdaemon and gpg-agent to release the smartcard.
+# A missing gpgconf dependency fails the function; failures of the component
+# terminations themselves are reported but never propagated - the consumer of
+# the card (for example ykman) is the real arbiter of whether the card is
+# free. The settle sleep always runs because a partial stop may still have
+# released the card.
+release_card() {
+    emulate -L zsh
+    _require_cmd gpgconf || return 1
+
+    local -i failed=0
+    command gpgconf --kill scdaemon 2>/dev/null || failed=1
+    command gpgconf --kill gpg-agent 2>/dev/null || failed=1
+
+    if (( failed )); then
+        echo "warning: failed to stop one or more GPG components" >&2
+    fi
+    sleep 1
+    return 0
+}
+
+# yk_openpgp_reset
+# DESTRUCTIVE: wipe the YubiKey OpenPGP applet to factory defaults.
+yk_openpgp_reset() {
+    emulate -L zsh
+    _require_cmd gpgconf || return 1
+    _require_cmd ykman || return 1
+
+    [[ -t 0 ]] || {
+        echo "yk_openpgp_reset requires an interactive terminal" >&2
+        return 1
+    }
+
+    # Best-effort; ykman will fail on its own if the card is still held.
+    release_card
+
+    echo "WARNING: this wipes all OpenPGP keys and resets PINs to factory defaults."
+    printf "Type 'yes' to continue: "
+
+    local ans
+    read -r ans
+    [[ "$ans" == "yes" ]] || {
+        echo "Aborted."
+        return 1
+    }
+
+    command ykman openpgp reset --force
+}
+
+# relearn
+# Re-register the smartcard with gpg-agent.
+relearn() {
+    emulate -L zsh
+    _require_cmd gpg-connect-agent || return 1
+    command gpg-connect-agent "scd serialno" "learn --force" /bye
+}
+
+# fixyk
+# Reset stale smartcard state after sleep or unplugging.
+fixyk() {
+    emulate -L zsh
+    _require_cmd gpgconf || return 1
+    _require_cmd gpg || return 1
+
+    command gpgconf --kill scdaemon || return 1
+    command gpg --card-status >/dev/null || {
+        echo "card status check failed; is the YubiKey plugged in?" >&2
+        return 1
+    }
+    echo OK
+}
+
+# ssh-agent-bw
+# Point SSH at the Bitwarden SSH agent socket.
+ssh-agent-bw() {
+    emulate -L zsh
+    local sock="$HOME/.bitwarden-ssh-agent.sock"
+
+    [[ -S "$sock" ]] || {
+        echo "SSH agent socket not found: $sock" >&2
+        return 1
+    }
+
+    export SSH_AUTH_SOCK="$sock"
+    echo "SSH_AUTH_SOCK -> $SSH_AUTH_SOCK"
+}
+
+# ssh-agent-gpg
+# Point SSH at the gpg-agent SSH socket.
+ssh-agent-gpg() {
+    emulate -L zsh
+    _require_cmd gpgconf || return 1
+
+    local sock
+    sock="$(command gpgconf --list-dirs agent-ssh-socket)" || {
+        echo "gpgconf failed" >&2
+        return 1
+    }
+
+    [[ -n "$sock" && -S "$sock" ]] || {
+        echo "SSH agent socket not found: ${sock:-<empty>}" >&2
+        return 1
+    }
+
+    export SSH_AUTH_SOCK="$sock"
+    echo "SSH_AUTH_SOCK -> $SSH_AUTH_SOCK"
+}
+
+# ============================================================================
+# Network
+# ============================================================================
+
+# myip
+# Show the public IPv4 address with a five-second provider timeout.
+# The response must be exactly one line containing only a dotted-quad IPv4
+# address; multiline bodies and carriage returns are rejected outright so
+# provider error pages or captive-portal HTML are never passed through.
+myip() {
+    emulate -L zsh
+    setopt extendedglob
+    _require_cmd curl || return 1
+
+    local ip
+    ip="$(command curl -sf -4 --max-time 5 "https://icanhazip.com/")" \
+        || ip="$(command curl -sf -4 --max-time 5 "https://api4.my-ip.io/ip")" \
+        || return 1
+
+    # Command substitution strips the trailing newline; any remaining line
+    # break or carriage return means a malformed response.
+    if [[ "$ip" == *[$'\r\n']* ]]; then
+        echo "provider returned a malformed (multiline or CR) response" >&2
+        return 1
+    fi
+
+    [[ "$ip" == <0-255>.<0-255>.<0-255>.<0-255> ]] || {
+        echo "provider returned an invalid IPv4 address: ${ip:-<empty>}" >&2
+        return 1
+    }
+
+    print -r -- "$ip"
+}
+
+# cidr
+# Show the ARIN-reported CIDR block containing the public IPv4 address.
+cidr() {
+    emulate -L zsh
+    _require_cmd whois || return 1
+    _require_cmd grep || return 1
+
+    local ip
+    ip="$(myip)" || {
+        echo "could not determine public IP" >&2
+        return 1
+    }
+
+    command whois -h "whois.arin.net" -- "n + $ip" | command grep "CIDR:" || {
+        echo "no CIDR found for $ip" >&2
+        return 1
+    }
+}
+
+# openpgpkey_lookup <email>
+# Look up the OPENPGPKEY DNS record for an email address per RFC 7929.
+# The local-part is lowercased and hashed with SHA-256; only the first 56
+# hex characters of the digest are used as the DNS label. Requires dig and
+# sha256sum (coreutils). Whitespace in the returned RDATA is removed and one
+# trailing newline is printed. A missing record therefore produces only that
+# newline. A non-zero exit from dig is propagated.
+openpgpkey_lookup() {
+    emulate -L zsh -o pipefail
+    _require "$1" "email" || return 1
+    _require_cmd dig || return 1
+    _require_cmd sha256sum || return 1
+    _require_cmd tr || return 1
+    _require_cmd cut || return 1
+
+    local email="$1"
+
+    # Reject addresses that lack exactly one '@'.
+    [[ "$email" == *@* && "$email" != *@*@* ]] || {
+        echo "invalid email address: $email" >&2
+        return 1
+    }
+
+    local local_part="${email%@*}"
+    local domain="${email#*@}"
+
+    [[ -n "$local_part" && -n "$domain" ]] || {
+        echo "invalid email address: $email" >&2
+        return 1
+    }
+
+    # RFC 7929 §3: hash the lowercased local-part; use the first 56 hex chars.
+    local lower_part hash
+    lower_part="$(printf '%s' "$local_part" | command tr '[:upper:]' '[:lower:]')"
+    hash="$(printf '%s' "$lower_part" | command sha256sum | command cut -c1-56)"
+
+    [[ ${#hash} -eq 56 ]] || {
+        echo "sha256sum produced an unexpected output" >&2
+        return 1
+    }
+
+    command dig +short OPENPGPKEY "${hash}._openpgpkey.${domain}" | \
+        command tr -d '[:space:]' && print
+}
+
+# openpgpkey_lookup_validate <email>
+# Look up an RFC 7929 OPENPGPKEY DNS record, decode and validate the returned
+# OpenPGP key material, and confirm that every primary key is already present
+# in the default GPG keyring. On success, print a validation summary followed
+# by GPG's colon-formatted key details.
+openpgpkey_lookup_validate() {
+    emulate -L zsh -o pipefail
+    setopt localtraps
+
+    _require "$1" "email" || return 1
+    _require_cmd base64 || return 1
+    _require_cmd gpg || return 1
+    _require_cmd mktemp || return 1
+    _require_cmd awk || return 1
+
+    local email="$1"
+
+    # Keep validation consistent with openpgpkey_lookup().
+    [[ "$email" == *@* && "$email" != *@*@* ]] || {
+        echo "openpgpkey_lookup_validate: invalid email address: $email" >&2
+        return 1
+    }
+
+    local local_part="${email%@*}"
+    local domain="${email#*@}"
+
+    [[ -n "$local_part" && -n "$domain" ]] || {
+        echo "openpgpkey_lookup_validate: invalid email address: $email" >&2
+        return 1
+    }
+
+    # Recreate the queried owner name for the validation summary. The lookup
+    # function performs the same RFC 7929 transformation and checks these
+    # dependencies itself.
+    _require_cmd sha256sum || return 1
+    _require_cmd tr || return 1
+    _require_cmd cut || return 1
+
+    local lower_part hash qname tmp_file
+    lower_part="$(printf '%s' "$local_part" | command tr '[:upper:]' '[:lower:]')" \
+        || return 1
+    hash="$(printf '%s' "$lower_part" | command sha256sum | command cut -c1-56)" \
+        || return 1
+
+    [[ ${#hash} -eq 56 ]] || {
+        echo "openpgpkey_lookup_validate: sha256sum produced an unexpected output" >&2
+        return 1
+    }
+
+    qname="${hash}._openpgpkey.${domain}"
+
+    tmp_file="$(command mktemp "${TMPDIR:-/tmp}/openpgpkey.XXXXXXXX")" || {
+        echo "openpgpkey_lookup_validate: unable to create temporary file" >&2
+        return 1
+    }
+
+    trap 'command rm -f -- "$tmp_file"' EXIT
+
+    # Decode base64: GNU coreutils uses -d, BSD/macOS uses -D.
+    # Detect which is available (GNU base64 supports --version).
+    local _b64_decode=(-d)
+    if ! command base64 --version >/dev/null 2>&1; then
+        _b64_decode=(-D)
+    fi
+    if ! openpgpkey_lookup "$email" \
+        | command base64 "${_b64_decode[@]}" >| "$tmp_file"
+    then
+        echo "openpgpkey_lookup_validate: unable to retrieve or decode DNS record" >&2
+        return 1
+    fi
+
+    [[ -s "$tmp_file" ]] || {
+        echo "openpgpkey_lookup_validate: no OPENPGPKEY record found for $email" >&2
+        return 1
+    }
+
+    local dns_fingerprints local_fingerprint
+    local -i missing=0
+    local -a dns_primary_fingerprints
+
+    dns_fingerprints="$(
+        command gpg \
+            --batch \
+            --quiet \
+            --with-colons \
+            --import-options show-only \
+            --import "$tmp_file" 2>/dev/null \
+        | command awk -F: '
+            $1 == "pub" {
+                primary = 1
+                next
+            }
+            primary && $1 == "fpr" {
+                print $10
+                primary = 0
+            }
+        '
+    )" || {
+        echo "openpgpkey_lookup_validate: decoded data is not a valid OpenPGP key" >&2
+        return 1
+    }
+
+    [[ -n "$dns_fingerprints" ]] || {
+        echo "openpgpkey_lookup_validate: decoded data is not a valid OpenPGP key" >&2
+        return 1
+    }
+
+    dns_primary_fingerprints=("${(@f)dns_fingerprints}")
+
+    for local_fingerprint in "${dns_primary_fingerprints[@]}"; do
+        if ! command gpg \
+            --batch \
+            --quiet \
+            --with-colons \
+            --list-keys -- "$local_fingerprint" 2>/dev/null \
+            | command awk -F: -v target="$local_fingerprint" '
+                $1 == "fpr" && $10 == target {
+                    found = 1
+                }
+                END {
+                    exit(found ? 0 : 1)
+                }
+            '
+        then
+            echo \
+                "openpgpkey_lookup_validate: key not found in keyring: $local_fingerprint" >&2
+            missing=1
+        fi
+    done
+
+    if (( missing )); then
+        echo \
+            "openpgpkey_lookup_validate: DNS key material does not match the local keyring" >&2
+        return 1
+    fi
+
+    echo "Validated OPENPGPKEY record:"
+    echo "  Email:      $email"
+    echo "  DNS name:   $qname"
+    echo "  Primary key(s):"
+
+    for local_fingerprint in "${dns_primary_fingerprints[@]}"; do
+        echo "    $local_fingerprint"
+    done
+
+    echo
+    command gpg \
+        --batch \
+        --with-colons \
+        --list-keys -- "${dns_primary_fingerprints[@]}"
+}
+
+# sshmount <host> <remote-path>
+# Mount a remote path over SSH. A failed mount removes only a mountpoint
+# directory created by this invocation. ':' is rejected because the host is
+# combined into the sshfs "host:path" argument.
+sshmount() {
+    emulate -L zsh
+    _require "$1" "host" || return 1
+    _require "$2" "remote-path" || return 1
+    _require_cmd sshfs || return 1
+
+    if [[ "$1" == "." || "$1" == ".." || "$1" == -* || "$1" == */* \
+        || "$1" == *:* || "$1" == *[[:space:]]* ]]; then
+        echo "invalid SSH host or alias: $1" >&2
+        return 1
+    fi
+
+    local mountroot="$HOME/mountpoints"
+    local mountpoint="$mountroot/$1"
+    local -i created=0
+
+    command mkdir -p -- "$mountroot" || return 1
+
+    if [[ -L "$mountpoint" ]]; then
+        echo "refusing symbolic-link mountpoint: $mountpoint" >&2
+        return 1
+    fi
+
+    if [[ -e "$mountpoint" && ! -d "$mountpoint" ]]; then
+        echo "mountpoint exists and is not a directory: $mountpoint" >&2
+        return 1
+    fi
+
+    if [[ ! -d "$mountpoint" ]]; then
+        command mkdir -- "$mountpoint" || return 1
+        created=1
+    fi
+
+    if command sshfs "${1}:${2}" "$mountpoint"; then
+        # sshfs can exit 0 even when the background mount fails to establish,
+        # so verify independently. macOS has no `mountpoint` utility; check
+        # the mount table instead (match the exact " on <path> " field).
+        if command mount | command grep -qF -- " on $mountpoint "; then
+            echo "${1}:${2} -> $mountpoint"
+            return 0
+        fi
+        echo "sshfs returned success but $mountpoint is not mounted" >&2
+    fi
+
+    if (( created )); then
+        command rmdir -- "$mountpoint" 2>/dev/null
+    fi
+    return 1
+}
+
+# wakenas
+# Send Wake-on-LAN packets to all configured NAS MAC addresses.
+# ${=NAS_MACS} explicitly splits the space-separated string into words.
+wakenas() {
+    emulate -L zsh
+    _require_cmd wakeonlan || return 1
+
+    [[ -n "$NAS_MACS" ]] || {
+        echo "NAS_MACS is empty" >&2
+        return 1
+    }
+
+    local mac
+    local -i rc=0
+
+    for mac in ${=NAS_MACS}; do
+        if command wakeonlan "$mac"; then
+            echo "sent magic packet -> $mac"
+        else
+            echo "failed to send magic packet -> $mac" >&2
+            rc=1
+        fi
+    done
+
+    return $rc
+}
+
+# ============================================================================
+# Files & Media
+# ============================================================================
+
+# getvid <folder> <url>
+# Download a video into ~/Movies/yt-dlp/<folder>.
+getvid() {
+    emulate -L zsh
+    _require "$1" "folder" || return 1
+    _require "$2" "url" || return 1
+    _require_cmd yt-dlp || return 1
+
+    if [[ "$1" == "." || "$1" == ".." || "$1" == */* ]]; then
+        echo "folder must be one name and cannot be '.' or '..'" >&2
+        return 1
+    fi
+
+    local target="$HOME/Movies/yt-dlp/$1"
+    command mkdir -p -- "$target" || return 1
+
+    command yt-dlp --merge-output-format mkv \
+        -o "${target}/%(title)s.%(ext)s" -- "$2"
+}
+
+# dedupe [dir...]
+# List duplicate files recursively. Default to the current directory.
+dedupe() {
+    emulate -L zsh
+    _require_cmd fdupes || return 1
+
+    if (( $# )); then
+        command fdupes -r -- "$@"
+    else
+        command fdupes -r -- .
+    fi
+}
+
+# resetmp3tag
+# Reset Mp3tag security-scoped bookmarks to fix repeated access prompts.
+resetmp3tag() {
+    emulate -L zsh
+    _require_cmd defaults || return 1
+    command defaults delete app.mp3tag.Mp3tag SecurityScopedBookmarks
+}
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+# entropy <charset-size> <length>
+# Calculate approximate entropy in bits.
+# (Previously named 'e', renamed to avoid PATH/alias collisions.)
+entropy() {
+    emulate -L zsh
+    _require "$1" "charset-size" || return 1
+    _require "$2" "length" || return 1
+    _require_cmd awk || return 1
+
+    [[ "$1" == <-> && "$2" == <-> ]] || {
+        echo "charset-size and length must be positive integers" >&2
+        return 1
+    }
+
+    command awk -v c="$1" -v l="$2" '
+        BEGIN {
+            if (c <= 1 || l <= 0) {
+                print "charset-size must exceed 1 and length must be positive" > "/dev/stderr"
+                exit 1
+            }
+            printf "%.2f bits\n", l * log(c) / log(2)
+        }
+    '
+}
+
+# calc <expression>
+# Evaluate an expression with floating-point calculations enabled.
+# zcalc is autoloaded at file scope above.
+# Example: calc '2**10 / 3.0'
+calc() {
+    emulate -L zsh
+    _require "$1" "expression" || return 1
+    zcalc -e -f "$*"
+}
+
+# colours
+# Print the 256-colour terminal palette, 16 entries per row.
+colours() {
+    emulate -L zsh
+    local i
+
+    for i in {0..255}; do
+        printf "\033[38;5;%sm%3s " "$i" "$i"
+        if (( (i + 1) % 16 == 0 )); then
+            printf "\033[0m\n"
+        fi
+    done
+}
+
+# blastem
+# Permanently remove zsh history and session state, then kill this shell.
+# All deletions are attempted; failures are reported in aggregate.
+# Other running shells may later recreate history from their in-memory state.
+# ~/.zsh_sessions contains all terminal sessions, not only the current one.
+#
+# Note: on APFS (the default macOS filesystem since High Sierra) file
+# deletion does not guarantee physical erasure — APFS is copy-on-write
+# and may retain data in snapshots or freed blocks. FileVault (full-disk
+# encryption) is the real control for data-at-rest protection.
+blastem() {
+    emulate -L zsh
+    setopt null_glob rm_star_silent
+
+    [[ -t 0 ]] || {
+        echo "blastem requires an interactive terminal" >&2
+        return 1
+    }
+
+    echo "WARNING: this removes zsh history, completion dumps, and all saved zsh sessions."
+    printf "Type 'DELETE ALL ZSH HISTORY' to continue: "
+
+    local answer
+    read -r answer
+    [[ "$answer" == "DELETE ALL ZSH HISTORY" ]] || {
+        echo "Aborted."
+        return 1
+    }
+
+    unset HISTFILE
+
+    local -i failed=0
+    command rm -f -- "$HOME/.zsh_history" 2>/dev/null || {
+        echo "failed to remove: $HOME/.zsh_history" >&2
+        failed=1
+    }
+    command rm -f -- "$HOME"/.zcompdump* 2>/dev/null || {
+        echo "failed to remove: $HOME/.zcompdump*" >&2
+        failed=1
+    }
+    command rm -rf -- "$HOME/.zsh_sessions" 2>/dev/null || {
+        echo "failed to remove: $HOME/.zsh_sessions" >&2
+        failed=1
+    }
+
+    (( failed )) && {
+        echo "one or more deletions failed; shell not killed" >&2
+        return 1
+    }
+
+    kill -KILL $$
+}
+
+# generate_modhex [bytes=16]
+# Generate one cryptographically secure Modhex string.
+# Raw arguments are bounded by digit length before integer conversion, and
+# conversion uses an explicit 10# base so leading zeros cannot be
+# re-interpreted under octal_zeroes.
+generate_modhex() {
+    emulate -L zsh -o pipefail
+    _require_cmd openssl || return 1
+    _require_cmd tr || return 1
+
+    local raw_bytes=${1:-16}
+
+    [[ "$raw_bytes" == <1-> && ${#raw_bytes} -le 7 ]] || {
+        echo "bytes must be a positive integer of at most 7 digits" >&2
+        return 1
+    }
+
+    local -i bytes=$(( 10#$raw_bytes ))
+    (( bytes <= 500000 )) || {
+        echo "bytes must not exceed 500000" >&2
+        return 1
+    }
+
+    command openssl rand -hex "$bytes" | _modhex
+}
+
+# generate_modhex_bulk [count=1] [chars=32]
+# Generate multiple Modhex strings in one pipeline. Character count must be
+# even because each random byte produces two hexadecimal characters. Total
+# output is capped at 1,000,000 characters. Raw arguments are bounded by
+# digit length before integer conversion, conversion forces base 10, and the
+# total-output limit uses division so the check itself cannot overflow.
+generate_modhex_bulk() {
+    emulate -L zsh -o pipefail
+    _require_cmd openssl || return 1
+    _require_cmd tr || return 1
+    _require_cmd fold || return 1
+
+    local raw_count=${1:-1}
+    local raw_chars=${2:-32}
+
+    [[ "$raw_count" == <1-> && ${#raw_count} -le 7 \
+        && "$raw_chars" == <1-> && ${#raw_chars} -le 7 ]] || {
+        echo "count and chars must be positive integers of at most 7 digits" >&2
+        return 1
+    }
+
+    local -i count=$(( 10#$raw_count ))
+    local -i chars=$(( 10#$raw_chars ))
+
+    (( chars % 2 == 0 )) || {
+        echo "chars must be even" >&2
+        return 1
+    }
+
+    (( count <= 1000000 / chars )) || {
+        echo "refusing to generate more than 1,000,000 characters" >&2
+        return 1
+    }
+
+    command openssl rand -hex $(( count * chars / 2 )) \
+        | command tr -d ' \n' \
+        | command fold -w "$chars" \
+        | _modhex
+}
+

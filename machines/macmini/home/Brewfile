@@ -1,0 +1,135 @@
+tap "deskflow/tap", trusted: true
+# Bourne-Again SHell, a UNIX command interpreter
+brew "bash"
+# Cryptography and SSL/TLS Toolkit
+brew "openssl@3"
+# Clone of cat(1) with syntax highlighting and Git integration
+brew "bat"
+# Secure and free password manager for all of your devices
+brew "bitwarden-cli"
+# GNU File, Shell, and Text utilities
+brew "coreutils"
+# Identify or delete duplicate files
+brew "fdupes"
+# Play, record, convert, and stream select audio and video codecs
+brew "ffmpeg"
+# Free lossless audio codec
+brew "flac"
+# Monitor a directory for changes and run a shell command
+brew "fswatch"
+# Utility for downloading TV and radio programmes from BBC iPlayer
+brew "get_iplayer"
+# GitHub command-line tool
+brew "gh"
+# Distributed revision control system
+brew "git"
+# GNU Privacy Guard (OpenPGP)
+brew "gnupg"
+# Library access to GnuPG
+brew "gpgme"
+# Agent multiplexer that lives in your terminal
+brew "herdr", restart_service: :changed
+# Lightweight and flexible command-line JSON processor
+brew "jq"
+# OpenBSD freely-licensed SSH connectivity tools
+brew "openssh"
+# Pinentry for GPG on Mac
+brew "pinentry-mac"
+# Tools for Multiple Arcade Machine Emulator
+brew "rom-tools"
+# Utility that provides fast incremental file transfer
+brew "rsync"
+# Terminal multiplexer
+brew "tmux"
+# Upgrade all the things
+brew "topgrade"
+# Sends magic packets to wake up network-devices
+brew "wakeonlan"
+# Internet file retriever
+brew "wget"
+# Tool for managing your YubiKey configuration
+brew "ykman"
+# Feature-rich command-line audio/video downloader
+brew "yt-dlp"
+# Compression and file packaging/archive utility
+brew "zip"
+# Stand alone ad blocker
+cask "adguard"
+# Configure Gatekeeper, unquarantine and self-sign apps
+cask "alienator88-sentinel"
+# Multi-cloud backup application
+cask "arq"
+# Records audio from any application
+cask "audio-hijack"
+# Desktop password and login vault
+cask "bitwarden"
+# Hard disk backup and cloning utility
+cask "carbon-copy-cloner"
+# Managed desktop virtualization solution
+cask "citrix-workspace"
+# Server and cloud storage browser
+cask "cyberduck"
+# Mouse and keyboard sharing utility
+cask "deskflow/tap/deskflow-dev"
+# Cloud backup tool
+cask "duplicacy-cli"
+# Client for emby media server
+cask "emby"
+# Web browser
+cask "firefox"
+# Finder replacement and FTP, SFTP, WebDAV and Amazon s3 client
+cask "forklift"
+# Web browser
+cask "google-chrome"
+# Open-source video transcoder
+cask "handbrake-app"
+# Free and open-source media player
+cask "iina"
+# Open Source m3u, m3u8 player
+cask "iptvnator"
+# Keep your computer awake
+cask "jiggler"
+# Remote desktop application
+cask "jump-desktop"
+# Productivity tool
+cask "launchbar"
+# Host-based application firewall
+cask "little-snitch"
+# Cable-free audio router
+cask "loopback"
+# Markdown editor
+cask "markedit"
+# Office suite
+cask "microsoft-office-businesspro"
+# Native app email client for Gmail
+cask "mimestream"
+# Utility to move and zoom windows—on one display
+cask "moom"
+# Tool for editing metadata of audio files including MP3, FLAC, OGG, and more
+cask "mp3tag"
+# VPN client
+cask "mullvad-vpn"
+# Extract files and folders from package files, disk images, and archives
+cask "pacifist"
+# Peer to peer Bitorrent client
+cask "qbittorrent"
+# Emoji picker optimised for blind people
+cask "rocket"
+# Screenshot measurement and annotation tool
+cask "shottr"
+# Sound and audio controller
+cask "soundsource"
+# Music streaming service
+cask "spotify"
+# Tool for managing the OpenSSH ssh client configuration file
+cask "ssh-config-editor"
+# Mesh VPN based on WireGuard
+cask "tailscale-app"
+# Unpacks archive files
+cask "the-unarchiver"
+# License free Wi-Fi, VPN, and Access Application for Organizations
+cask "unifi-identity-endpoint"
+# Multimedia player
+cask "vlc"
+# Menu bar toolkit with keep-awake, system monitor and volume mixer
+cask "vorssaint"
