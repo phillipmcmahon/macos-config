@@ -1,0 +1,88 @@
+# Bourne-Again SHell, a UNIX command interpreter
+brew "bash"
+# Cryptography and SSL/TLS Toolkit
+brew "openssl@3"
+# Clone of cat(1) with syntax highlighting and Git integration
+brew "bat"
+# Secure and free password manager for all of your devices
+brew "bitwarden-cli"
+# GNU File, Shell, and Text utilities
+brew "coreutils"
+# Identify or delete duplicate files
+brew "fdupes"
+# Play, record, convert, and stream select audio and video codecs
+brew "ffmpeg"
+# Free lossless audio codec
+brew "flac"
+# Utility for downloading TV and radio programmes from BBC iPlayer
+brew "get_iplayer"
+# GitHub command-line tool
+brew "gh"
+# GNU Privacy Guard (OpenPGP)
+brew "gnupg"
+# Library access to GnuPG
+brew "gpgme"
+# Lightweight and flexible command-line JSON processor
+brew "jq"
+# OpenBSD freely-licensed SSH connectivity tools
+brew "openssh"
+# Pinentry for GPG on Mac
+brew "pinentry-mac"
+# Tools for Multiple Arcade Machine Emulator
+brew "rom-tools"
+# Utility that provides fast incremental file transfer
+brew "rsync"
+# Terminal multiplexer
+brew "tmux"
+# Upgrade all the things
+brew "topgrade"
+# Sends magic packets to wake up network-devices
+brew "wakeonlan"
+# Tool for managing your YubiKey configuration
+brew "ykman"
+# Feature-rich command-line audio/video downloader
+brew "yt-dlp"
+# Stand alone ad blocker
+cask "adguard"
+# Multi-cloud backup application
+cask "arq"
+# Records audio from any application
+cask "audio-hijack"
+# Desktop password and login vault
+cask "bitwarden"
+# Managed desktop virtualization solution
+cask "citrix-workspace"
+# Client for emby media server
+cask "emby"
+# Web browser
+cask "firefox"
+# Web browser
+cask "google-chrome"
+# Open-source video transcoder
+cask "handbrake-app"
+# Open Source m3u, m3u8 player
+cask "iptvnator"
+# Cable-free audio router
+cask "loopback"
+# Office suite
+cask "microsoft-office-businesspro"
+# Native app email client for Gmail
+cask "mimestream"
+# Utility to move and zoom windows—on one display
+cask "moom"
+# Tool for editing metadata of audio files including MP3, FLAC, OGG, and more
+cask "mp3tag"
+# VPN client
+cask "mullvad-vpn"
+# Local-first alternative to Logitech Options+ for HID++ devices
+cask "openlogi"
+# Home media player
+cask "plex"
+# Sound and audio controller
+cask "soundsource"
+# Music streaming service
+cask "spotify"
+# License free Wi-Fi, VPN, and Access Application for Organizations
+cask "unifi-identity-endpoint"
+# Multimedia player
+cask "vlc"
