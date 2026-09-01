@@ -44,6 +44,8 @@ brew "ykman"
 brew "yt-dlp"
 # Stand alone ad blocker
 cask "adguard"
+# VPN for privacy and security
+cask "adguard-vpn"
 # Multi-cloud backup application
 cask "arq"
 # Records audio from any application
