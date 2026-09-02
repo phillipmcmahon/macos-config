@@ -109,8 +109,16 @@ cask "moom"
 cask "mp3tag"
 # VPN client
 cask "mullvad-vpn"
+# Reverse proxy, secure introspectable tunnels to localhost
+cask "ngrok"
+# Audiobook manager for Audible users
+cask "openaudible"
+# Local-first alternative to Logitech Options+ for HID++ devices
+cask "openlogi"
 # Extract files and folders from package files, disk images, and archives
 cask "pacifist"
+# Home media player
+cask "plex"
 # Peer to peer Bitorrent client
 cask "qbittorrent"
 # Emoji picker optimised for blind people
