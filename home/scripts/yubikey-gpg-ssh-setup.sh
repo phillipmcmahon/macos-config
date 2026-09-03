@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+#
+# yubikey-gpg-ssh-setup.sh — one-shot YubiKey + GPG + SSH agent setup on macOS
+#
+# Version: 1.0.1
+#
+# v1.0.1:
+#   - Fixed: gpgconf --kill now issues separate calls for gpg-agent and
+#     scdaemon (gpgconf accepts a single component per invocation; a second
+#     argument may be silently ignored, leaving the agent holding the card)
+#
 set -Eeuo pipefail
 
 KEYID="0xA11E70ADFDA60CF9"
@@ -81,7 +91,10 @@ EOF
 fi
 
 # 6. Restart agents and learn the card
-gpgconf --kill gpg-agent scdaemon
+# gpgconf accepts a single component per invocation; a second argument may
+# be silently ignored on older GnuPG, leaving the agent holding the card.
+gpgconf --kill scdaemon
+gpgconf --kill gpg-agent
 gpgconf --launch gpg-agent
 gpg --card-status >/dev/null
 
@@ -90,4 +103,3 @@ SSH_AUTH_SOCK="$(gpgconf --list-dirs agent-ssh-socket)"
 export SSH_AUTH_SOCK
 echo "--- SSH public key (add to servers/GitHub): ---"
 ssh-add -L
-
