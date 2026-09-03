@@ -3,6 +3,15 @@
 # mac_cleanup.sh — Comprehensive macOS cleanup (Sequoia 15 / Tahoe 26+)
 # Run: sudo ./mac_cleanup.sh [-y] [--dry-run] [--spotlight]
 #
+# v2.1.0 — 2026-09-03
+#   • iOS device-backup deletion is now opt-in (--ios-backups). Previously
+#     section 8 unconditionally wiped ~/Library/Application Support/
+#     MobileSync/Backup/ — backups that can be tens of gigabytes and are
+#     irreplaceable if the device is lost and iCloud backup is off.
+#   • Xcode Archive deletion is now opt-in (--xcode-archives). Archives
+#     contain signed, notarised release builds; DerivedData (build cache)
+#     is still always cleared.
+#
 # v2.0.1 — 2026-09-01
 #   • Fixed Time Machine snapshot deletion: the date string is now correctly
 #     extracted from the snapshot name (previously passed the literal suffix
@@ -24,7 +33,7 @@ set -Euo pipefail
 # when a cache directory is already empty).  failglob is intentionally OFF.
 shopt -s nullglob
 
-readonly VERSION="2.0.1"
+readonly VERSION="2.1.0"
 
 # ──────────── Colours (disabled when stdout is not a terminal) ────────────
 if [[ -t 1 ]]; then
@@ -46,6 +55,8 @@ ${C_BOLD}Options:${C_RESET}
   --dry-run           Show what would be done without deleting anything
   --spotlight         Rebuild the Spotlight index (slow — hours of CPU)
   --flush-routes      Flush the routing table (can disrupt VPN / active connections)
+  --ios-backups       Delete local iOS device backups (opt-in — backups are irreplaceable)
+  --xcode-archives    Delete Xcode Archives (opt-in — contains signed release builds)
   --skip-browsers     Do not touch browser caches (Safari, Chrome, Firefox, etc.)
   -h, --help          Show this help
   -v, --version       Print version and exit
@@ -57,6 +68,8 @@ ASSUME_YES=0
 DRY_RUN=0
 DO_SPOTLIGHT=0
 FLUSH_ROUTES=0
+DO_IOS_BACKUPS=0
+DO_XCODE_ARCHIVES=0
 SKIP_BROWSERS=0
 
 for arg in "$@"; do
@@ -65,6 +78,8 @@ for arg in "$@"; do
         --dry-run)          DRY_RUN=1 ;;
         --spotlight)        DO_SPOTLIGHT=1 ;;
         --flush-routes)     FLUSH_ROUTES=1 ;;
+        --ios-backups)      DO_IOS_BACKUPS=1 ;;
+        --xcode-archives)   DO_XCODE_ARCHIVES=1 ;;
         --skip-browsers)    SKIP_BROWSERS=1 ;;
         -h|--help)          usage; exit 0 ;;
         -v|--version)       echo "mac_cleanup.sh v${VERSION}"; exit 0 ;;
@@ -318,9 +333,14 @@ fi
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  6. APP-SPECIFIC CACHES & JUNK                                          ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-step "Clearing Xcode derived data & archives (if present)"
+step "Clearing Xcode derived data (if present)"
 safe_rm "$USER_HOME"/Library/Developer/Xcode/DerivedData/*
-safe_rm "$USER_HOME"/Library/Developer/Xcode/Archives/*
+if (( DO_XCODE_ARCHIVES )); then
+    step "Clearing Xcode Archives (--xcode-archives)"
+    safe_rm "$USER_HOME"/Library/Developer/Xcode/Archives/*
+else
+    step "Xcode Archives skipped (pass --xcode-archives to include)"
+fi
 safe_rm "$USER_HOME"/Library/Developer/Xcode/iOS\ Device\ Logs/*
 safe_rm "$USER_HOME"/Library/Developer/CoreSimulator/Caches/*
 
@@ -416,22 +436,26 @@ elif command -v docker >/dev/null 2>&1 && [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  8. OLD iOS DEVICE BACKUPS                                               ║
+# ║  8. OLD iOS DEVICE BACKUPS (opt-in: --ios-backups)                       ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-step "Clearing old iOS device backups (if present)"
-BACKUP_DIR="$USER_HOME/Library/Application Support/MobileSync/Backup"
-if [[ -d "$BACKUP_DIR" ]]; then
-    backup_sz=$(_sizeof "$BACKUP_DIR")
-    if (( backup_sz > 0 )); then
-        if [[ "$DRY_RUN" -eq 1 ]]; then
-            log "  ${C_YELLOW}[dry-run]${C_RESET} would remove iOS backups ($(human_bytes "$backup_sz")): $BACKUP_DIR"
-        else
-            log "  ${C_YELLOW}Warning:${C_RESET} Removing ALL local iOS backups ($(human_bytes "$backup_sz"))"
-            log "  (iCloud backups are not affected)"
-            BYTES_FREED=$(( BYTES_FREED + backup_sz ))
-            rm -rf "${BACKUP_DIR:?}"/* 2>/dev/null || true
+if (( DO_IOS_BACKUPS )); then
+    step "Clearing old iOS device backups (--ios-backups)"
+    BACKUP_DIR="$USER_HOME/Library/Application Support/MobileSync/Backup"
+    if [[ -d "$BACKUP_DIR" ]]; then
+        backup_sz=$(_sizeof "$BACKUP_DIR")
+        if (( backup_sz > 0 )); then
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                log "  ${C_YELLOW}[dry-run]${C_RESET} would remove iOS backups ($(human_bytes "$backup_sz")): $BACKUP_DIR"
+            else
+                log "  ${C_YELLOW}Warning:${C_RESET} Removing ALL local iOS backups ($(human_bytes "$backup_sz"))"
+                log "  (iCloud backups are not affected)"
+                BYTES_FREED=$(( BYTES_FREED + backup_sz ))
+                rm -rf "${BACKUP_DIR:?}"/* 2>/dev/null || true
+            fi
         fi
     fi
+else
+    step "iOS device backups skipped (pass --ios-backups to include)"
 fi
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗

@@ -2,7 +2,14 @@
 #
 # bootstrap.sh
 #
-# Version: 1.2.0
+# Version: 1.3.0
+#
+# v1.3.0:
+#   - Replaced PAT-in-URL authentication with GIT_ASKPASS: the token is no
+#     longer embedded in the clone URL (which leaks into the process table
+#     and would persist in .git/config if the remote-set-url step ever
+#     failed).  A mode-700 temp script supplies the token to git via
+#     GIT_ASKPASS and is deleted immediately after the clone.
 #
 # v1.2.0:
 #   - Brewfile is now machine-specific: brew bundle reads from
@@ -108,9 +115,21 @@ fi
 
 log "Cloning repository"
 mkdir -p "$(dirname "$REPO_DIR")"
-git clone --branch "$GIT_BRANCH" \
-    "https://${GITHUB_PAT}@github.com/${GITHUB_USER}/${GITHUB_REPO}.git" \
+
+# Use GIT_ASKPASS to supply the PAT without embedding it in the URL.
+# The helper is a mode-700 temp script that echoes the token once and is
+# deleted immediately after the clone finishes (or fails).
+_GIT_ASKPASS="$(mktemp)"
+chmod 700 "$_GIT_ASKPASS"
+printf '#!/bin/sh\necho "%s"\n' "$GITHUB_PAT" > "$_GIT_ASKPASS"
+trap 'rm -f "$_GIT_ASKPASS"' EXIT
+
+GIT_ASKPASS="$_GIT_ASKPASS" git clone --branch "$GIT_BRANCH" \
+    "https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git" \
     "$REPO_DIR"
+
+rm -f "$_GIT_ASKPASS"
+trap - EXIT
 
 # Switch to the SSH remote for all future operations.
 git -C "$REPO_DIR" remote set-url origin "git@github.com:${GITHUB_USER}/${GITHUB_REPO}.git"
@@ -198,4 +217,3 @@ log "Next steps:"
 log "  1. Open a new terminal session (or run: exec zsh)"
 log "  2. Verify your configuration with: macos-config-sync.sh status"
 log "  3. Revoke the PAT — SSH is now configured: https://github.com/settings/tokens"
-

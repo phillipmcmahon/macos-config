@@ -2,7 +2,15 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.0.2
+# Version: 2.0.3
+#
+# v2.0.3:
+#   - Secret scanner now scans tracked files (git ls-files) instead of walking
+#     the working tree with find.  The previous approach scanned .gitignore'd
+#     files, editor swap files, and other untracked artefacts — producing false
+#     positives and missing the fact that only committed content matters.
+#   - Clarified binary-file detection: rewrote the double-negative
+#     `grep -qv '^text/'` as `! grep -q '^text/'` for readability.
 #
 # v2.0.2:
 #   - Fixed: commits could be stranded locally and never reach GitHub. When
@@ -1160,53 +1168,56 @@ SECRET_FILENAME_PATTERNS=(
 scan_for_secrets() {
     require_repository
 
-    # Scan both the shared tree and every machine-specific tree.
-    local -a scan_roots=()
-    [[ -d "$REPO_DIR/home" ]] && scan_roots+=("$REPO_DIR/home")
-    [[ -d "$REPO_DIR/machines" ]] && scan_roots+=("$REPO_DIR/machines")
-    (( ${#scan_roots[@]} > 0 )) || return 0
-
-    log "Scanning staged files for secret material"
+    log "Scanning tracked files for secret material"
 
     local -i findings=0
-    local pattern file relative_path scan_root
+    local pattern file relative_path
 
     local combined_pattern
     combined_pattern=$(printf '%s\n' "${SECRET_CONTENT_PATTERNS[@]}" | paste -sd'|' -)
 
-    for scan_root in "${scan_roots[@]}"; do
-        # Check filenames
-        while IFS= read -r -d '' file; do
-            relative_path="${file#"$REPO_DIR"/}"
-            for pattern in "${SECRET_FILENAME_PATTERNS[@]}"; do
-                if [[ "$relative_path" =~ $pattern ]]; then
-                    warn "Suspicious filename: $relative_path (matches: $pattern)"
-                    findings=$((findings + 1))
-                    break
+    # Scan only files tracked by git (not the working-tree walk that find
+    # would do).  This avoids false positives from .gitignore'd files,
+    # editor swap files, and other untracked artefacts.  Restrict to the
+    # home/ and machines/ trees — the same scope the old find-based scanner
+    # covered — so repository-internal files (e.g. .git/) are excluded.
+    local -a tracked_files=()
+    while IFS= read -r file; do
+        case "$file" in
+            home/*|machines/*) tracked_files+=("$file") ;;
+        esac
+    done < <(git -C "$REPO_DIR" ls-files)
+
+    (( ${#tracked_files[@]} > 0 )) || { log "Secret scan passed (no tracked files to scan)"; return 0; }
+
+    for relative_path in "${tracked_files[@]}"; do
+        file="$REPO_DIR/$relative_path"
+        [[ -f "$file" ]] || continue
+
+        # Check filename against suspicious patterns
+        for pattern in "${SECRET_FILENAME_PATTERNS[@]}"; do
+            if [[ "$relative_path" =~ $pattern ]]; then
+                warn "Suspicious filename: $relative_path (matches: $pattern)"
+                findings=$((findings + 1))
+                break
+            fi
+        done
+
+        # Check file contents (text files only — skip binary)
+        if ! file --brief --mime-type "$file" 2>/dev/null | grep -q '^text/'; then
+            continue
+        fi
+
+        if grep -qE "$combined_pattern" "$file" 2>/dev/null; then
+            warn "Possible secret content in: $relative_path"
+            # Show which pattern matched (without revealing the secret value)
+            for pattern in "${SECRET_CONTENT_PATTERNS[@]}"; do
+                if grep -qE "$pattern" "$file" 2>/dev/null; then
+                    warn "  matched pattern: $pattern"
                 fi
             done
-        done < <(find "$scan_root" -type f -print0)
-
-        # Check file contents (text files only, skip binary)
-        while IFS= read -r -d '' file; do
-            relative_path="${file#"$REPO_DIR"/}"
-
-            # Skip binary files
-            if file --brief --mime-type "$file" 2>/dev/null | grep -qv '^text/'; then
-                continue
-            fi
-
-            if grep -qE "$combined_pattern" "$file" 2>/dev/null; then
-                warn "Possible secret content in: $relative_path"
-                # Show which pattern matched (without revealing the secret value)
-                for pattern in "${SECRET_CONTENT_PATTERNS[@]}"; do
-                    if grep -qE "$pattern" "$file" 2>/dev/null; then
-                        warn "  matched pattern: $pattern"
-                    fi
-                done
-                findings=$((findings + 1))
-            fi
-        done < <(find "$scan_root" -type f -print0)
+            findings=$((findings + 1))
+        fi
     done
 
     if (( findings > 0 )); then
