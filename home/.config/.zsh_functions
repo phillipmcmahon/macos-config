@@ -1,5 +1,10 @@
 # ============================================================================
-# zsh function library - v2.17
+# zsh function library - v2.18
+#
+# v2.18:
+#   - clearxattr(): new function to recursively clear all extended attributes
+#     (including com.apple.quarantine) from a file or directory. Path is
+#     resolved to its canonical absolute form via greadlink before clearing.
 #
 # v2.17:
 #   - sshmount(): verifies the mount actually established after sshfs
@@ -507,7 +512,7 @@ decrypt() {
     local output="$1"
 
     if [[ "$1" == (#b)(*).[0-9](#c8)-[0-9](#c6)[+-][0-9](#c4).asc ]]; then
-        output="$match[1]"
+        output="$match"
     else
         case "$1" in
             *.gpg)
@@ -1112,6 +1117,32 @@ resetmp3tag() {
     command defaults delete app.mp3tag.Mp3tag SecurityScopedBookmarks
 }
 
+# clearxattr <path>
+# Recursively clear all extended attributes (including com.apple.quarantine)
+# from a file or directory. The path is resolved to its canonical absolute
+# form first, so symlinks and relative paths are handled correctly.
+clearxattr() {
+    emulate -L zsh
+
+    _require "$1" "path" || return 1
+    _require_cmd greadlink || return 1
+    _require_cmd xattr || return 1
+
+    local path_full
+    path_full="$(command greadlink -f -- "$1")" || {
+        echo "could not resolve path: $1" >&2
+        return 1
+    }
+
+    [[ -e "$path_full" ]] || {
+        echo "no such file or directory: $path_full" >&2
+        return 1
+    }
+
+    command xattr -cr -- "$path_full"
+    echo "cleared extended attributes: $path_full"
+}
+
 # ============================================================================
 # Utilities
 # ============================================================================
@@ -1283,4 +1314,3 @@ generate_modhex_bulk() {
         | command fold -w "$chars" \
         | _modhex
 }
-
