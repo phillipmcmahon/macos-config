@@ -1,8 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # inflate-zips.sh
 #
-# Version: 1.0.1
+# Version: 1.0.2
+#
+# v1.0.2:
+#   - Changed shebang from #!/bin/bash to #!/usr/bin/env bash for
+#     consistency with the rest of the repository and to ensure
+#     Homebrew's bash is used on macOS.
 #
 # v1.0.1:
 #   - Removed unused counter variables (count, success, failed). The
