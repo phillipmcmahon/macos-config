@@ -1,4 +1,13 @@
-#!/bin/sh
+#!/usr/bin/env bash
+#
+# install-bios.sh
+#
+# Version: 1.0.1
+#
+# v1.0.1:
+#   - Changed shebang from #!/bin/sh to #!/usr/bin/env bash for
+#     consistency with the rest of the repository.
+#
 set -eu
 
 # One-line bootstrap and local wrapper. The downloaded installer is accepted
