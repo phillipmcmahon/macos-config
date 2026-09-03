@@ -2,7 +2,21 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.0.3
+# Version: 2.0.4
+#
+# v2.0.4:
+#   - Secret scanner now stages all changes (git add --all) before scanning,
+#     then inspects the staged index via git diff --cached.  The v2.0.3 scan
+#     used git ls-files which only returns already-tracked files — a newly
+#     added config file could be committed without ever being scanned.
+#   - Replaced MIME-based binary detection (file --mime-type | grep '^text/')
+#     with content-based detection (grep -Iq).  The MIME approach classified
+#     application/json (and similar structured-text types) as non-text,
+#     silently skipping files that may contain credentials.
+#   - Added github_pat_ to SECRET_CONTENT_PATTERNS — GitHub fine-grained
+#     personal access tokens use this prefix and were not previously detected.
+#   - If the secret scan finds issues, the staged changes are unstaged
+#     (git reset) so the push is cleanly aborted without leaving a dirty index.
 #
 # v2.0.3:
 #   - Secret scanner now scans tracked files (git ls-files) instead of walking
@@ -119,7 +133,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.0.2"
+readonly SCRIPT_VERSION="2.0.4"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -1087,7 +1101,8 @@ has_unpushed_commits() {
 commit_and_push() {
 require_repository
 
-run git -C "$REPO_DIR" add --all
+# Files are already staged by scan_for_secrets (git add --all runs there
+# so the scan covers newly added files).  No need to re-stage here.
 
 if [[ "$DRY_RUN" == "1" ]]; then
     run git -C "$REPO_DIR" status --short
@@ -1127,10 +1142,12 @@ log "Changes pushed to GitHub"
 # Pre-push secret scan
 # ----
 #
-# The .config directory is synced with a blocklist (EXCLUDE_PATTERNS), which
-# means any new tool that stores secrets under ~/.config with an unlisted
-# filename will be committed silently. This scan checks staged files for
-# common secret material patterns and aborts the push if any are found.
+# Defence-in-depth for all managed files — shared paths, machine-specific
+# configuration, and any newly added managed paths.  The scan stages all
+# pending changes (git add --all), then inspects the staged index
+# (git diff --cached) for common secret material patterns and aborts the
+# push if any are found.  If the scan fails, staged changes are unstaged
+# (git reset) so the push is cleanly aborted without leaving a dirty index.
 #
 
 # Patterns that strongly indicate secret material when found in file content.
@@ -1143,6 +1160,7 @@ SECRET_CONTENT_PATTERNS=(
     'ghp_[0-9a-zA-Z]{36}'
     'gho_[0-9a-zA-Z]{36}'
     'ghs_[0-9a-zA-Z]{36}'
+    'github_pat_[0-9a-zA-Z_]{22,}'
     'glpat-[0-9a-zA-Z_\-]{20}'
     'sk-[0-9a-zA-Z]{20,}'
     'xox[bpars]-[0-9a-zA-Z\-]+'
@@ -1168,7 +1186,12 @@ SECRET_FILENAME_PATTERNS=(
 scan_for_secrets() {
     require_repository
 
-    log "Scanning tracked files for secret material"
+    # Stage everything first so that newly added files are included in the
+    # scan.  Without this, git diff --cached would miss files that have
+    # never been tracked before.
+    run git -C "$REPO_DIR" add --all
+
+    log "Scanning staged files for secret material"
 
     local -i findings=0
     local pattern file relative_path
@@ -1176,21 +1199,23 @@ scan_for_secrets() {
     local combined_pattern
     combined_pattern=$(printf '%s\n' "${SECRET_CONTENT_PATTERNS[@]}" | paste -sd'|' -)
 
-    # Scan only files tracked by git (not the working-tree walk that find
-    # would do).  This avoids false positives from .gitignore'd files,
-    # editor swap files, and other untracked artefacts.  Restrict to the
-    # home/ and machines/ trees — the same scope the old find-based scanner
-    # covered — so repository-internal files (e.g. .git/) are excluded.
-    local -a tracked_files=()
-    while IFS= read -r file; do
+    # Enumerate staged files (added, copied, modified, renamed) restricted
+    # to the home/ and machines/ trees so repository-internal files (e.g.
+    # .git/, README.md) are excluded.  NUL-delimited for safe handling of
+    # paths with spaces or special characters.
+    local -a staged_files=()
+    while IFS= read -r -d '' file; do
         case "$file" in
-            home/*|machines/*) tracked_files+=("$file") ;;
+            home/*|machines/*) staged_files+=("$file") ;;
         esac
-    done < <(git -C "$REPO_DIR" ls-files)
+    done < <(git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR -z)
 
-    (( ${#tracked_files[@]} > 0 )) || { log "Secret scan passed (no tracked files to scan)"; return 0; }
+    if (( ${#staged_files[@]} == 0 )); then
+        log "Secret scan passed (no staged files to scan)"
+        return 0
+    fi
 
-    for relative_path in "${tracked_files[@]}"; do
+    for relative_path in "${staged_files[@]}"; do
         file="$REPO_DIR/$relative_path"
         [[ -f "$file" ]] || continue
 
@@ -1203,8 +1228,11 @@ scan_for_secrets() {
             fi
         done
 
-        # Check file contents (text files only — skip binary)
-        if ! file --brief --mime-type "$file" 2>/dev/null | grep -q '^text/'; then
+        # Skip binary files.  grep -Iq reads the first buffer and exits
+        # quietly if it finds a NUL byte — unlike the previous MIME-based
+        # check, this correctly treats application/json (and other
+        # structured-text MIME types) as scannable text.
+        if ! grep -Iq '' "$file" 2>/dev/null; then
             continue
         fi
 
@@ -1225,6 +1253,9 @@ scan_for_secrets() {
         warn "Secret scan found $findings suspicious file(s) in the repository."
         warn "Review the warnings above. If these are false positives, add"
         warn "appropriate patterns to EXCLUDE_PATTERNS and re-run push."
+        # Unstage everything so the push is cleanly aborted without leaving
+        # a dirty index that a subsequent push would skip over.
+        git -C "$REPO_DIR" reset --quiet HEAD -- . 2>/dev/null || true
         die "Aborting push — resolve secret scan findings first."
     fi
 

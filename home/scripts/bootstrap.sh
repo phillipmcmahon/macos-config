@@ -2,7 +2,27 @@
 #
 # bootstrap.sh
 #
-# Version: 1.3.0
+# Version: 1.3.3
+#
+# v1.3.3:
+#   - GITHUB_PAT and _GIT_ASKPASS are now unset immediately after the clone
+#     so that child processes (brew bundle, macos-config-sync.sh restore)
+#     do not inherit the token unnecessarily.
+#
+# v1.3.2:
+#   - PAT documentation now recommends a fine-grained token scoped to the
+#     macos-config repository with "Contents: Read-only" instead of a
+#     classic PAT with the broad 'repo' scope.  Classic PATs still work
+#     and are mentioned as a fallback.  The runtime prompt also links to
+#     the fine-grained token creation page.
+#
+# v1.3.1:
+#   - Improved GIT_ASKPASS helper: the helper script now distinguishes
+#     username from password prompts (returns GITHUB_USER for username,
+#     GITHUB_PAT for password).  The PAT is kept in the environment rather
+#     than being written into the temporary script, so it never touches disk.
+#     GIT_TERMINAL_PROMPT=0 is set to prevent git from falling through to
+#     an interactive terminal prompt if the helper fails.
 #
 # v1.3.0:
 #   - Replaced PAT-in-URL authentication with GIT_ASKPASS: the token is no
@@ -48,9 +68,17 @@
 #   — or —
 #   bash bootstrap.sh
 #
-# A GitHub Personal Access Token (PAT) with 'repo' scope is required for the
-# initial clone (SSH keys are not yet available on a fresh machine). Create
-# one at: https://github.com/settings/tokens
+# A GitHub Personal Access Token (PAT) is required for the initial clone
+# (SSH keys are not yet available on a fresh machine).
+#
+# Recommended: create a fine-grained PAT scoped to the macos-config
+# repository with "Contents: Read-only" permission (the minimum needed
+# for cloning).  Create one at:
+#   https://github.com/settings/personal-access-tokens/new
+#
+# A classic PAT with 'repo' scope also works but grants broader access
+# than necessary.  Whichever type you use, revoke it after bootstrap
+# completes — SSH handles all subsequent operations.
 #
 # After the first pull restores your SSH keys and Git configuration, the
 # sync script uses the SSH remote for all subsequent operations.
@@ -105,7 +133,9 @@ fi
 
 if [[ -z "${GITHUB_PAT:-}" ]]; then
     log "A GitHub Personal Access Token is required for the initial clone."
-    log "Create one at: https://github.com/settings/tokens (repo scope)"
+    log "Create a fine-grained PAT at: https://github.com/settings/personal-access-tokens/new"
+    log "  → scope it to the macos-config repository with Contents: Read-only"
+    log "  (a classic PAT with 'repo' scope also works)"
     printf '[bootstrap] GitHub PAT: '
     read -rs GITHUB_PAT </dev/tty
     printf '\n'
@@ -117,19 +147,28 @@ log "Cloning repository"
 mkdir -p "$(dirname "$REPO_DIR")"
 
 # Use GIT_ASKPASS to supply the PAT without embedding it in the URL.
-# The helper is a mode-700 temp script that echoes the token once and is
-# deleted immediately after the clone finishes (or fails).
+# The helper distinguishes username from password prompts and reads both
+# values from the environment, so the PAT never touches disk.
 _GIT_ASKPASS="$(mktemp)"
 chmod 700 "$_GIT_ASKPASS"
-printf '#!/bin/sh\necho "%s"\n' "$GITHUB_PAT" > "$_GIT_ASKPASS"
+cat > "$_GIT_ASKPASS" <<'HELPER'
+#!/bin/sh
+case "$1" in
+    *[Uu]sername*) echo "$GITHUB_USER" ;;
+    *)             echo "$GITHUB_PAT"  ;;
+esac
+HELPER
 trap 'rm -f "$_GIT_ASKPASS"' EXIT
 
-GIT_ASKPASS="$_GIT_ASKPASS" git clone --branch "$GIT_BRANCH" \
+export GITHUB_USER GITHUB_PAT
+GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$_GIT_ASKPASS" \
+    git clone --branch "$GIT_BRANCH" \
     "https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git" \
     "$REPO_DIR"
 
 rm -f "$_GIT_ASKPASS"
 trap - EXIT
+unset GITHUB_PAT _GIT_ASKPASS
 
 # Switch to the SSH remote for all future operations.
 git -C "$REPO_DIR" remote set-url origin "git@github.com:${GITHUB_USER}/${GITHUB_REPO}.git"
