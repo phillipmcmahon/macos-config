@@ -2,7 +2,20 @@
 #
 # bootstrap.sh
 #
-# Version: 1.3.3
+# Version: 1.4.0
+#
+# v1.4.0:
+#   - Auto-detection of repository visibility: the script now probes the
+#     HTTPS remote with `git ls-remote` (GIT_TERMINAL_PROMPT=0) before
+#     prompting for credentials.  If the repo is publicly accessible the
+#     clone proceeds without authentication and the PAT prompt is skipped
+#     entirely.  If the probe fails (private repo, network error) the
+#     existing PAT flow kicks in as before.
+#   - The "Revoke the PAT" reminder in the Next Steps output is now
+#     conditional — it only appears when a PAT was actually used.
+#   - A pre-set GITHUB_PAT in the environment is respected but the script
+#     still auto-detects first; the PAT is used only if the repo turns
+#     out to be private.
 #
 # v1.3.3:
 #   - GITHUB_PAT and _GIT_ASKPASS are now unset immediately after the clone
@@ -59,7 +72,7 @@
 #
 # Sets up a fresh Mac from scratch:
 #   1. Installs Homebrew (which installs Xcode Command Line Tools)
-#   2. Clones the private macos-config repository via HTTPS
+#   2. Clones the macos-config repository via HTTPS (auto-detects auth)
 #   3. Runs brew bundle to install all packages
 #   4. Runs macos-config-sync.sh restore to restore configuration files
 #
@@ -68,20 +81,23 @@
 #   — or —
 #   bash bootstrap.sh
 #
-# A GitHub Personal Access Token (PAT) is required for the initial clone
-# (SSH keys are not yet available on a fresh machine).
+# Authentication:
+#   The script auto-detects whether the repository is public or private.
+#   - Public repo  → clones over HTTPS with no credentials needed.
+#   - Private repo → prompts for a GitHub Personal Access Token (PAT).
 #
-# Recommended: create a fine-grained PAT scoped to the macos-config
-# repository with "Contents: Read-only" permission (the minimum needed
-# for cloning).  Create one at:
-#   https://github.com/settings/personal-access-tokens/new
+#   If you need a PAT, create a fine-grained token scoped to the
+#   macos-config repository with "Contents: Read-only" permission:
+#     https://github.com/settings/personal-access-tokens/new
+#   A classic PAT with 'repo' scope also works but grants broader access
+#   than necessary.  Revoke the PAT after bootstrap completes — SSH
+#   handles all subsequent operations.
 #
-# A classic PAT with 'repo' scope also works but grants broader access
-# than necessary.  Whichever type you use, revoke it after bootstrap
-# completes — SSH handles all subsequent operations.
+#   You can also pre-export GITHUB_PAT before running the script; it will
+#   still auto-detect and only use the PAT if the repo is private.
 #
-# After the first pull restores your SSH keys and Git configuration, the
-# sync script uses the SSH remote for all subsequent operations.
+# After the initial clone restores your SSH keys and Git configuration,
+# the sync script uses the SSH remote for all subsequent operations.
 #
 
 set -euo pipefail
@@ -131,44 +147,57 @@ fi
 # 2. Clone the configuration repository
 # ----
 
-if [[ -z "${GITHUB_PAT:-}" ]]; then
-    log "A GitHub Personal Access Token is required for the initial clone."
-    log "Create a fine-grained PAT at: https://github.com/settings/personal-access-tokens/new"
-    log "  → scope it to the macos-config repository with Contents: Read-only"
-    log "  (a classic PAT with 'repo' scope also works)"
-    printf '[bootstrap] GitHub PAT: '
-    read -rs GITHUB_PAT </dev/tty
-    printf '\n'
-fi
-
-[[ -n "$GITHUB_PAT" ]] || die "No GitHub PAT provided."
+CLONE_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
+_USED_PAT=""
 
 log "Cloning repository"
 mkdir -p "$(dirname "$REPO_DIR")"
 
-# Use GIT_ASKPASS to supply the PAT without embedding it in the URL.
-# The helper distinguishes username from password prompts and reads both
-# values from the environment, so the PAT never touches disk.
-_GIT_ASKPASS="$(mktemp)"
-chmod 700 "$_GIT_ASKPASS"
-cat > "$_GIT_ASKPASS" <<'HELPER'
+# Auto-detect whether the repo is publicly accessible.
+# git ls-remote is lightweight (no data transfer) and GIT_TERMINAL_PROMPT=0
+# ensures git never falls through to an interactive credential prompt.
+if GIT_TERMINAL_PROMPT=0 git ls-remote "$CLONE_URL" HEAD &>/dev/null; then
+    # ── Public: clone without authentication ──
+    log "Repository is publicly accessible — no PAT required"
+    git clone --branch "$GIT_BRANCH" "$CLONE_URL" "$REPO_DIR"
+else
+    # ── Private: fall back to PAT authentication ──
+    log "Repository requires authentication."
+
+    if [[ -z "${GITHUB_PAT:-}" ]]; then
+        log "Create a fine-grained PAT at: https://github.com/settings/personal-access-tokens/new"
+        log "  → scope it to the macos-config repository with Contents: Read-only"
+        log "  (a classic PAT with 'repo' scope also works)"
+        printf '[bootstrap] GitHub PAT: '
+        read -rs GITHUB_PAT </dev/tty
+        printf '\n'
+    fi
+
+    [[ -n "${GITHUB_PAT:-}" ]] || die "No GitHub PAT provided."
+
+    # Use GIT_ASKPASS to supply the PAT without embedding it in the URL.
+    # The helper distinguishes username from password prompts and reads both
+    # values from the environment, so the PAT never touches disk.
+    _GIT_ASKPASS="$(mktemp)"
+    chmod 700 "$_GIT_ASKPASS"
+    cat > "$_GIT_ASKPASS" <<'HELPER'
 #!/bin/sh
 case "$1" in
     *[Uu]sername*) echo "$GITHUB_USER" ;;
     *)             echo "$GITHUB_PAT"  ;;
 esac
 HELPER
-trap 'rm -f "$_GIT_ASKPASS"' EXIT
+    trap 'rm -f "$_GIT_ASKPASS"' EXIT
 
-export GITHUB_USER GITHUB_PAT
-GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$_GIT_ASKPASS" \
-    git clone --branch "$GIT_BRANCH" \
-    "https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git" \
-    "$REPO_DIR"
+    export GITHUB_USER GITHUB_PAT
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$_GIT_ASKPASS" \
+        git clone --branch "$GIT_BRANCH" "$CLONE_URL" "$REPO_DIR"
 
-rm -f "$_GIT_ASKPASS"
-trap - EXIT
-unset GITHUB_PAT _GIT_ASKPASS
+    rm -f "$_GIT_ASKPASS"
+    trap - EXIT
+    unset GITHUB_PAT _GIT_ASKPASS
+    _USED_PAT=1
+fi
 
 # Switch to the SSH remote for all future operations.
 git -C "$REPO_DIR" remote set-url origin "git@github.com:${GITHUB_USER}/${GITHUB_REPO}.git"
@@ -255,4 +284,6 @@ log ""
 log "Next steps:"
 log "  1. Open a new terminal session (or run: exec zsh)"
 log "  2. Verify your configuration with: macos-config-sync.sh status"
-log "  3. Revoke the PAT — SSH is now configured: https://github.com/settings/tokens"
+if [[ -n "${_USED_PAT:-}" ]]; then
+    log "  3. Revoke the PAT — SSH is now configured: https://github.com/settings/tokens"
+fi
