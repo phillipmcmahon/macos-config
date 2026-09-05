@@ -2,7 +2,17 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.0.4
+# Version: 2.1.0
+#
+# v2.1.0:
+#   - New: generate_installed_apps_list() scans /Applications for .app
+#     bundles and writes a sorted, newline-delimited inventory (application
+#     name without the .app suffix) to ~/installed-apps.txt. The file is
+#     generated automatically on every push, before files are collected.
+#   - installed-apps.txt is tracked as a machine-specific file (stored
+#     under machines/<machine-name>/home/ in the repository), so each Mac
+#     maintains its own independent application inventory.
+#   - Respects DRY_RUN: when DRY_RUN=1 the file is not written.
 #
 # v2.0.4:
 #   - Secret scanner now stages all changes (git add --all) before scanning,
@@ -133,7 +143,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.0.4"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -209,6 +219,7 @@ MACHINE_DIRECTORIES=(
 
 MACHINE_FILES=(
     "Brewfile"
+    "installed-apps.txt"
 )
 
 # Patterns excluded from every managed directory sync.
@@ -982,6 +993,36 @@ log "Repository initialised: $REPO_DIR"
 }
 
 # ----
+# Installed applications inventory
+# ----
+#
+# Generates a sorted list of all .app bundles found directly inside
+# /Applications (depth 1 only — nested helper apps are excluded). The
+# .app suffix is stripped so the output is a clean, human-readable
+# application name per line. The file is written to ~/installed-apps.txt
+# and tracked as a machine-specific managed file, giving each Mac its
+# own inventory in the repository.
+
+generate_installed_apps_list() {
+    local output_file
+    output_file="$(local_path "installed-apps.txt")"
+
+    log "Generating installed applications list: $output_file"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY-RUN: Would write installed apps list to $output_file"
+        return 0
+    fi
+
+    find /Applications -maxdepth 1 -name '*.app' -print0 |
+        xargs -0 -n1 basename |
+        sed 's/\.app$//' |
+        LC_ALL=C sort -f >"$output_file"
+
+    log "Listed $(wc -l < "$output_file" | tr -d ' ') applications"
+}
+
+# ----
 # Mac to repository
 # ----
 collect_local_files() {
@@ -1269,6 +1310,7 @@ require_repository
 show_tool_versions
 
 update_from_remote_before_push
+generate_installed_apps_list
 collect_local_files
 prune_unmanaged_repository_paths
 prune_unmanaged_machine_paths

@@ -1,0 +1,38 @@
+Adguard
+AdGuard VPN
+Arq
+Audio Hijack
+Bitwarden
+Citrix Workspace
+Emby
+Firefox
+Google Chrome
+HandBrake
+Hazel
+IPTVnator
+Jellyfin Desktop
+Loopback
+Microsoft 365 Copilot Shim
+Microsoft Defender Shim
+Microsoft Excel
+Microsoft OneNote
+Microsoft Outlook
+Microsoft PowerPoint
+Microsoft Teams
+Microsoft Word
+Mimestream
+Moom
+Mp3tag
+Mullvad VPN
+OneDrive
+OpenLogi
+Plex
+Safari
+SMBMounter
+SoundSource
+Spotify
+Task Manager TMOG
+UniFi Endpoint
+VLC
+ZoomVDI
+ZoomVDIUninstaller
