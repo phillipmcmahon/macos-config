@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.2
+# Version: 1.3.4
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -19,7 +19,26 @@
 # YubiKey present): it decrypt-tests every '-unverified' export and renames
 # BOTH the local copy and its NAS copy (after confirming they are identical).
 # If the NAS is not mounted at that time, the NAS copy keeps its
-# '-unverified' name until a later '--verify' run finds it mounted.
+# '-unverified' name; a later '--verify' with the NAS mounted reconciles it
+# in a second pass (hash-matched against the verified local copy, or
+# decrypt-tested directly if no local copy remains).
+#
+# v1.3.4:
+#   - --verify has a second reconciliation pass over NAS '-unverified'
+#     files, so a NAS copy that was offline during an earlier --verify
+#     can still be reconciled (matched against a verified local copy, or
+#     decrypt-tested directly if no local copy remains).
+#   - Concurrency lock (mkdir-based, stale-PID aware): two exports, or an
+#     export and a --verify, cannot run at the same time.
+#   - INT/TERM traps now just exit; cleanup runs once from the EXIT trap.
+#   - Wording: local/NAS rename happens "after all checks", not atomically.
+#
+# v1.3.3:
+#   - --verify performs ALL checks (decrypt test, NAS hash, no existing
+#     target names) before renaming anything; local and NAS copies are then
+#     renamed together. Never overwrites an existing verified file.
+#   - Rotation comment clarified: an unattended run deliberately makes its
+#     '-unverified' export current and rotates the previous one.
 #
 # v1.3.2:
 #   - GPG encryption subkey is chosen by explicit creation timestamp
@@ -41,8 +60,9 @@
 #     unlocked state is left as found. BW_SESSION is unset once the last
 #     Bitwarden operation has completed.
 #   - Rotation of the previous local (and NAS) export into archive/ is
-#     deferred until the new export has been encrypted and verified, so a
-#     failed run never removes the last known-good backup.
+#     deferred until the new export has been encrypted (and, when
+#     interactive, decrypt-tested), so a failed run never removes the
+#     previous backup.
 #   - ZIP archive is integrity-tested (unzip -t) before encryption.
 #   - Plaintext ZIP is securely deleted immediately after encryption.
 #   - "Decryption test passed" is only printed when a decrypt actually ran.
@@ -64,6 +84,7 @@
 #   bw-export.sh            run an export (interactive: vault unlock + decrypt test)
 #   bw-export.sh --verify   decrypt-test pending '-unverified' exports and
 #                           rename local + NAS copies (needs YubiKey + TTY)
+# A lock in $downloads_dir prevents concurrent runs of either mode.
 #
 set -Eeuo pipefail
 
@@ -74,6 +95,7 @@ downloads_dir="$HOME/Documents/encrypted/bw-export"
 nas_mount="/Volumes/home"
 nas_dir="$nas_mount/documents/encrypted/bw-export"
 gpg_key="0xA11E70ADFDA60CF9"
+lock_dir="$downloads_dir/.bw-export.lock"
 zip_file="bw-auto-export-$(date +%Y%m%d-%H%M%S%z).zip"
 
 # ----
@@ -155,9 +177,13 @@ finish_bw_session() {
 # Cleanup trap (registered before any secret material exists)
 # ----
 random_dir=""
+lock_held=0
 cleanup() {
   set +e  # cleanup is best-effort; never abort mid-wipe
   finish_bw_session
+  if [ "$lock_held" -eq 1 ]; then
+    rm -rf "$lock_dir"
+  fi
   if [ -n "$random_dir" ] && [ -d "$random_dir" ]; then
     # See secure_rm_file for the APFS caveat.
     if command -v shred >/dev/null 2>&1; then
@@ -168,7 +194,41 @@ cleanup() {
     rm -rf "$random_dir"
   fi
 }
-trap cleanup EXIT INT TERM
+# Signals only trigger an exit (with the conventional 128+signal status);
+# the single EXIT trap then performs cleanup exactly once.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ----
+# Concurrency lock
+# ----
+# mkdir is atomic on local and network filesystems and needs no flock(1),
+# which macOS does not ship. The PID inside lets a later run detect and
+# clear a lock left behind by a crashed/killed process.
+acquire_lock() {
+  local other_pid
+  mkdir -p "$downloads_dir"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    lock_held=1
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+  other_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
+    echo "Error: another bw-export.sh (PID $other_pid) is running. Aborting." >&2
+    exit 1
+  fi
+  echo "Warning: removing stale lock $lock_dir (owner PID '${other_pid:-unknown}' not running)." >&2
+  rm -rf "$lock_dir"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    lock_held=1
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+  echo "Error: could not acquire lock $lock_dir. Aborting." >&2
+  exit 1
+}
 
 # ----
 # Pre-flight checks
@@ -226,7 +286,7 @@ echo "Using GPG encryption key fingerprint $gpg_enc_fpr"
 # the local copy and its NAS copy together.
 # ----
 verify_pending() {
-  local f name verified_name nas_note rc=0 count=0
+  local f name verified_name nas_note has_nas candidate rc=0 count=0
   if [[ ! -t 0 ]]; then
     echo "Error: --verify needs an interactive session (YubiKey PIN entry)." >&2
     return 1
@@ -234,7 +294,7 @@ verify_pending() {
   if nas_available; then
     nas_note="NAS mounted; NAS copies will be renamed too."
   else
-    nas_note="NAS not mounted; NAS copies (if any) keep their '-unverified' name until a later --verify."
+    nas_note="NAS not mounted; NAS copies (if any) keep their '-unverified' name until a later --verify with the NAS mounted."
   fi
   echo "$nas_note"
 
@@ -243,38 +303,102 @@ verify_pending() {
     count=$((count + 1))
     name=$(basename "$f")
     verified_name="${name%-unverified.zip.gpg}.zip.gpg"
+    has_nas=0
     echo "Verifying $name..."
+
+    # --- Phase 1: all checks. Nothing is renamed until every check passes. ---
+
+    # Never overwrite an existing verified file (local or NAS).
+    if [ -e "$downloads_dir/$verified_name" ]; then
+      echo "Error: $downloads_dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
+      rc=1; continue
+    fi
+    if nas_available && [ -f "$nas_dir/$name" ]; then
+      has_nas=1
+      if [ -e "$nas_dir/$verified_name" ]; then
+        echo "Error: $nas_dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
+        rc=1; continue
+      fi
+    fi
+
+    # The NAS copy is only considered verified if it is byte-identical to
+    # the local file we are about to decrypt-test.
+    if [ "$has_nas" -eq 1 ] && [ "$(sha256_of "$f")" != "$(sha256_of "$nas_dir/$name")" ]; then
+      echo "Error: NAS copy $name differs from the local copy (SHA-256 mismatch); nothing renamed." >&2
+      rc=1; continue
+    fi
+
     if ! gpg --decrypt "$f" >/dev/null 2>&1; then
       echo "Error: $name failed to decrypt — left as-is for inspection." >&2
-      rc=1
-      continue
+      rc=1; continue
     fi
+
+    # --- Phase 2: all checks passed — rename local, then NAS. ---
+    # Two separate renames cannot be atomic; if the second fails the NAS
+    # copy stays '-unverified' and the NAS pass below reconciles it later.
     mv "$f" "$downloads_dir/$verified_name"
     echo "  local: renamed to $verified_name"
-
-    if nas_available && [ -f "$nas_dir/$name" ]; then
-      # Only rename the NAS copy if it is byte-identical to the file we
-      # actually decrypt-tested; otherwise it has not been verified.
-      if [ "$(sha256_of "$downloads_dir/$verified_name")" = "$(sha256_of "$nas_dir/$name")" ]; then
-        mv "$nas_dir/$name" "$nas_dir/$verified_name"
+    if [ "$has_nas" -eq 1 ]; then
+      if mv "$nas_dir/$name" "$nas_dir/$verified_name"; then
         echo "  nas:   renamed to $verified_name"
       else
-        echo "Error: NAS copy $name differs from the verified local copy (SHA-256 mismatch); NAS copy left as '-unverified'." >&2
+        echo "Error: local copy renamed but NAS rename failed; NAS copy remains $name." >&2
         rc=1
       fi
     fi
   done < <(find "$downloads_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg" | sort)
 
   [ "$count" -gt 0 ] || echo "No '-unverified' exports found in $downloads_dir."
+
+  # --- Pass 2: reconcile NAS '-unverified' files whose local copy has ---
+  # --- already been verified (e.g. the NAS was offline at the time).   ---
+  if nas_available; then
+    local nas_count=0 local_verified
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      nas_count=$((nas_count + 1))
+      name=$(basename "$f")
+      verified_name="${name%-unverified.zip.gpg}.zip.gpg"
+      echo "Reconciling NAS copy $name..."
+      if [ -e "$nas_dir/$verified_name" ]; then
+        echo "Error: $nas_dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
+        rc=1; continue
+      fi
+      # Prefer matching against a verified local copy (current or archived)
+      # so the YubiKey is not needed; otherwise decrypt-test the NAS file.
+      local_verified=""
+      for candidate in "$downloads_dir/$verified_name" "$downloads_dir/archive/$verified_name"; do
+        [ -f "$candidate" ] && { local_verified="$candidate"; break; }
+      done
+      if [ -n "$local_verified" ]; then
+        if [ "$(sha256_of "$local_verified")" != "$(sha256_of "$f")" ]; then
+          echo "Error: NAS copy $name differs from verified local copy $local_verified (SHA-256 mismatch); left as-is." >&2
+          rc=1; continue
+        fi
+        echo "  matches verified local copy $local_verified"
+      elif gpg --decrypt "$f" >/dev/null 2>&1; then
+        echo "  no local copy; decrypt test on NAS copy passed"
+      else
+        echo "Error: no local copy and NAS copy $name failed to decrypt — left as-is." >&2
+        rc=1; continue
+      fi
+      mv "$f" "$nas_dir/$verified_name"
+      echo "  nas:   renamed to $verified_name"
+    done < <(find "$nas_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg" | sort)
+    [ "$nas_count" -gt 0 ] || echo "No '-unverified' exports left on NAS."
+  fi
+
   return "$rc"
 }
 
 case "${1:-}" in
   --verify)
+    acquire_lock
     verify_pending
     exit $?
     ;;
   "")
+    acquire_lock
     ;;
   *)
     echo "Usage: $0 [--verify]" >&2
@@ -435,8 +559,13 @@ fi
 # ----
 # Rotate previous local export(s) and install the new one
 # ----
-# Deferred until here so that a failure anywhere above leaves the previous
-# known-good export untouched in $downloads_dir.
+# Deferred until here so that a failure anywhere above (export, zip test,
+# encryption, or an interactive decrypt test) leaves the previous export
+# untouched in $downloads_dir. Note: in an unattended run the decrypt test
+# is skipped by design, so a new '-unverified' export deliberately becomes
+# current here and the previous (possibly verified) export is rotated into
+# archive/. It is not deleted, and the '-unverified' name makes the
+# distinction visible until '--verify' has been run.
 find "$downloads_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*.zip.gpg" \
   -exec mv {} "$downloads_dir/archive/" \;
 mv "$random_dir/$zip_file.gpg" "$downloads_dir/$final_name"
