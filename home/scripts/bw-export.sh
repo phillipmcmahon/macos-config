@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.0
+# Version: 1.3.1
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -9,8 +9,23 @@
 # to a NAS if mounted.
 #
 # Plaintext is staged under $TMPDIR (not ~/Documents) to reduce the chance
-# of iCloud/backup capture. Decrypt verification is skipped in
-# non-interactive sessions.
+# of iCloud/backup capture.
+#
+# Decrypt verification needs the YubiKey + PIN, so it only runs in an
+# interactive session. Unattended runs (cron/launchd) ARE allowed to become
+# the current backup — an unverified backup beats none — but are named
+# bw-auto-export-<ts>-unverified.zip.gpg so they are never mistaken for a
+# recovery-tested one. Verify later with 'gpg --decrypt <file> >/dev/null'
+# and drop the '-unverified' suffix.
+#
+# v1.3.1:
+#   - Unverified (non-interactive) exports are installed/replicated under a
+#     distinct '-unverified' name; a failed decrypt test is kept as
+#     DECRYPT-FAILED-*.zip.gpg outside the rotation glob.
+#   - Rotation globs narrowed to bw-auto-export-*.zip.gpg.
+#   - Simpler GPG encryption-subkey selection (still --with-colons).
+#   - 'df -P' called without '--' for macOS df compatibility.
+#   - mktemp template restored to ten X's.
 #
 # v1.3.0:
 #   - Only 'bw lock' if this script performed the unlock; pre-existing
@@ -147,11 +162,16 @@ if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1
   exit 1
 fi
 
-# Resolve the recipient to exactly one primary key and pick its current
-# encryption-capable (sub)key fingerprint. Encrypting to "<fpr>!" removes
-# any ambiguity from multiple matching keys and, together with an explicit
-# trust model, avoids interactive prompts.
-gpg_colons=$(gpg --batch --with-colons --list-keys -- "$gpg_key" 2>/dev/null) || {
+# Resolve the recipient to exactly one primary key and pick its newest
+# usable encryption-capable (sub)key fingerprint. Encrypting to "<fpr>!"
+# removes any ambiguity from multiple matching keys and, together with an
+# explicit trust model, avoids interactive prompts.
+#
+# --with-colons record layout (see gnupg/doc/DETAILS):
+#   pub/sub records: field 2 = validity, field 12 = key capabilities
+#   fpr record:      field 10 = fingerprint of the preceding pub/sub
+# gpg lists subkeys in creation order, so the last match is the newest.
+gpg_colons=$(gpg --batch --with-colons --list-keys "$gpg_key" 2>/dev/null) || {
   echo "Error: GPG key $gpg_key not found in keyring." >&2
   exit 1
 }
@@ -160,21 +180,10 @@ if [ "$primary_count" -ne 1 ]; then
   echo "Error: GPG key spec '$gpg_key' matches $primary_count primary keys; expected exactly 1." >&2
   exit 1
 fi
-# Field 2 = validity (i/d/r/e/n = invalid/disabled/revoked/expired/never-trust),
-# field 6 = creation time, field 12 = capabilities (lowercase = this key).
 gpg_enc_fpr=$(printf '%s\n' "$gpg_colons" | awk -F: '
-  $1 == "pub" || $1 == "sub" {
-    want = (index($12, "e") > 0 && $2 !~ /^[idren]$/)
-    created = $6 + 0
-    next
-  }
-  $1 == "fpr" && want {
-    if (created >= best) { best = created; fpr = $10 }
-    want = 0
-    next
-  }
-  { want = 0 }
-  END { if (fpr != "") print fpr }')
+  ($1 == "pub" || $1 == "sub") { want = ($12 ~ /e/ && $2 !~ /^[idren]$/); next }
+  $1 == "fpr" && want          { fpr = $10; want = 0 }
+  END                          { print fpr }')
 if [ -z "$gpg_enc_fpr" ]; then
   echo "Error: GPG key $gpg_key has no valid encryption-capable (sub)key." >&2
   exit 1
@@ -217,7 +226,7 @@ esac
 # On macOS $TMPDIR is normally a per-user directory that is not synced by
 # iCloud; nothing beyond that is assumed about its lifecycle or filesystem.
 # Falls back to /tmp if $TMPDIR is unset.
-random_dir=$(mktemp -d "${TMPDIR:-/tmp}/bw_export_XXXX")
+random_dir=$(mktemp -d "${TMPDIR:-/tmp}/bw_export_XXXXXXXXXX")
 
 # ----
 # Export vault
@@ -305,17 +314,25 @@ secure_rm_file "$random_dir/$zip_file"
 # A backup that can't be decrypted is worthless — hard-fail before the
 # previous local export is rotated out or anything is copied to the NAS.
 # The decryption test requires the YubiKey + interactive PIN entry.
-# In a non-interactive context (cron/launchd) skip it rather than hang.
+#
+# Policy for non-interactive runs (cron/launchd): the export IS installed
+# and replicated — an unverified backup is better than none — but under a
+# distinct '-unverified' name so it can never be confused with a
+# recovery-tested backup. Verify it manually and rename it when convenient.
+final_name="$zip_file.gpg"
 if [[ ! -t 0 ]]; then
-  echo "Warning: non-interactive session — skipping decrypt verification." >&2
-  echo "Run 'gpg --decrypt $downloads_dir/$zip_file.gpg >/dev/null' manually to verify." >&2
+  final_name="${zip_file%.zip}-unverified.zip.gpg"
+  echo "Warning: non-interactive session — decrypt verification skipped." >&2
+  echo "Export will be installed as $final_name (NOT recovery-tested)." >&2
+  echo "Verify with: gpg --decrypt '$downloads_dir/$final_name' >/dev/null" >&2
+  echo "then rename it to '$zip_file.gpg'." >&2
 else
   if gpg --decrypt "$random_dir/$zip_file.gpg" >/dev/null 2>&1; then
     echo "Decryption test passed."
   else
-    # Keep the unverified file out of the rotation glob so it can never be
-    # mistaken for (or archived as) a good backup, but retain it for inspection.
-    failed_copy="$downloads_dir/UNVERIFIED-$zip_file.gpg"
+    # Keep the file out of the rotation glob so it is never installed,
+    # rotated or replicated as a backup, but retain it for inspection.
+    failed_copy="$downloads_dir/DECRYPT-FAILED-$zip_file.gpg"
     mv "$random_dir/$zip_file.gpg" "$failed_copy"
     echo "Error: could not decrypt the export — check your YubiKey." >&2
     echo "Encrypted file kept at $failed_copy for inspection; previous export left in place, NAS copy skipped." >&2
@@ -328,44 +345,46 @@ fi
 # ----
 # Deferred until here so that a failure anywhere above leaves the previous
 # known-good export untouched in $downloads_dir.
-find "$downloads_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*" \
+find "$downloads_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*.zip.gpg" \
   -exec mv {} "$downloads_dir/archive/" \;
-mv "$random_dir/$zip_file.gpg" "$downloads_dir/"
-echo "Encrypted export saved to $downloads_dir/$zip_file.gpg"
+mv "$random_dir/$zip_file.gpg" "$downloads_dir/$final_name"
+echo "Encrypted export saved to $downloads_dir/$final_name"
 
 # ----
 # Copy to NAS if mounted
 # ----
 # Check that $nas_mount is an actual mount point (not merely a directory
 # left behind on the local disk) before touching anything under it.
-# 'df -P' reports the filesystem's mount point in the last column.
+# 'df -P' reports the filesystem's mount point in the last column. No '--'
+# is passed: $nas_mount is a fixed absolute path (cannot look like an
+# option) and the native macOS df does not reliably accept '--'.
 nas_mounted=0
 if [ -d "$nas_mount" ]; then
-  mounted_on=$(df -P -- "$nas_mount" 2>/dev/null | awk 'NR == 2 {print $NF}')
+  mounted_on=$(df -P "$nas_mount" 2>/dev/null | awk 'NR == 2 {print $NF}')
   [ "$mounted_on" = "$nas_mount" ] && nas_mounted=1
 fi
 
 if [ "$nas_mounted" -eq 1 ] && [ -d "$nas_dir" ]; then
   mkdir -p "$nas_dir/archive"
-  echo "Copying $zip_file.gpg to $nas_dir"
-  cp "$downloads_dir/$zip_file.gpg" "$nas_dir/"
+  echo "Copying $final_name to $nas_dir"
+  cp "$downloads_dir/$final_name" "$nas_dir/"
 
   # Verify the copy byte-for-byte before rotating the previous NAS export.
-  src_sha=$(sha256_of "$downloads_dir/$zip_file.gpg")
-  dst_sha=$(sha256_of "$nas_dir/$zip_file.gpg")
+  src_sha=$(sha256_of "$downloads_dir/$final_name")
+  dst_sha=$(sha256_of "$nas_dir/$final_name")
   if [ "$src_sha" != "$dst_sha" ]; then
     echo "Error: NAS copy verification failed (SHA-256 mismatch)." >&2
     echo "  local: $src_sha" >&2
     echo "  nas:   $dst_sha" >&2
-    rm -f -- "$nas_dir/$zip_file.gpg"
+    rm -f -- "$nas_dir/$final_name"
     echo "Corrupt NAS copy removed; previous NAS export left in place." >&2
     exit 1
   fi
   echo "NAS copy verified (SHA-256 $src_sha)."
 
   # Rotate everything except the file we just copied.
-  find "$nas_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*" \
-    ! -name "$zip_file.gpg" -exec mv {} "$nas_dir/archive/" \;
+  find "$nas_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*.zip.gpg" \
+    ! -name "$final_name" -exec mv {} "$nas_dir/archive/" \;
 else
   echo "NAS not mounted at $nas_mount (or $nas_dir missing) — skipping NAS copy."
 fi
