@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.7
+# Version: 1.3.8
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -23,6 +23,14 @@
 # in a second pass (hash-matched against the verified local copy, or
 # decrypt-tested directly if no local copy remains). Both passes cover the
 # current directory and archive/.
+#
+# v1.3.8:
+#   - Only items that actually have attachments get a directory in the
+#     archive. Previously 'select(.attachments != null)' also matched the
+#     empty array '[]' that the CLI reports for most items, producing one
+#     empty directory per vault item (and a 700+ line 'zip' listing).
+#   - Trailing slash stripped from $TMPDIR (macOS sets one), avoiding
+#     '//' in staged paths.
 #
 # v1.3.7:
 #   - Both local and NAS installation refuse to proceed if a file with the
@@ -531,7 +539,9 @@ esac
 # On macOS $TMPDIR is normally a per-user directory that is not synced by
 # iCloud; nothing beyond that is assumed about its lifecycle or filesystem.
 # Falls back to /tmp if $TMPDIR is unset.
-random_dir=$(mktemp -d "${TMPDIR:-/tmp}/bw_export_XXXXXXXXXX")
+tmp_root="${TMPDIR:-/tmp}"
+tmp_root="${tmp_root%/}"  # macOS sets TMPDIR with a trailing slash
+random_dir=$(mktemp -d "$tmp_root/bw_export_XXXXXXXXXX")
 
 # ----
 # Export vault
@@ -545,7 +555,9 @@ bw export --format json --output "$random_dir/bitwarden_export.json"
 # ----
 # Capture output first so a failure in 'bw list items' aborts the script
 # instead of silently producing an empty loop.
-items=$(bw list items | jq -c '.[] | select(.attachments != null)')
+# Only items with at least one attachment. The CLI reports '[]' (not null)
+# for items without attachments, so test the length rather than null-ness.
+items=$(bw list items | jq -c '.[] | select((.attachments // []) | length > 0)')
 
 # Process substitution (< <(...)) keeps the loop body in the current shell
 # so that (a) 'set -e' propagates failures from 'bw get attachment' to the
