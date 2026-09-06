@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.4
+# Version: 1.3.5
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -21,7 +21,16 @@
 # If the NAS is not mounted at that time, the NAS copy keeps its
 # '-unverified' name; a later '--verify' with the NAS mounted reconciles it
 # in a second pass (hash-matched against the verified local copy, or
-# decrypt-tested directly if no local copy remains).
+# decrypt-tested directly if no local copy remains). Both passes cover the
+# current directory and archive/.
+#
+# v1.3.5:
+#   - Lock is never removed automatically (the check-PID/rm/mkdir sequence
+#     was racy); a held lock aborts with instructions for manual removal.
+#   - --verify scans current dir AND archive/, both locally and on the NAS,
+#     renaming files in place.
+#   - Mode is parsed first; --verify only requires gpg + a SHA-256 tool and
+#     skips encryption-key resolution.
 #
 # v1.3.4:
 #   - --verify has a second reconciliation pass over NAS '-unverified'
@@ -84,7 +93,8 @@
 #   bw-export.sh            run an export (interactive: vault unlock + decrypt test)
 #   bw-export.sh --verify   decrypt-test pending '-unverified' exports and
 #                           rename local + NAS copies (needs YubiKey + TTY)
-# A lock in $downloads_dir prevents concurrent runs of either mode.
+# A lock in $downloads_dir prevents concurrent runs of either mode; a lock
+# left by a hard-killed run must be removed manually (the script says how).
 #
 set -Eeuo pipefail
 
@@ -204,8 +214,11 @@ trap 'exit 143' TERM
 # Concurrency lock
 # ----
 # mkdir is atomic on local and network filesystems and needs no flock(1),
-# which macOS does not ship. The PID inside lets a later run detect and
-# clear a lock left behind by a crashed/killed process.
+# which macOS does not ship. The PID inside is informational only: a lock
+# is NEVER removed automatically, because "check PID, then rm, then mkdir"
+# is racy (two late starters can both see a dead PID and both proceed).
+# If a run was killed hard and left the lock behind, the user removes it
+# after confirming no bw-export.sh is running.
 acquire_lock() {
   local other_pid
   mkdir -p "$downloads_dir"
@@ -215,36 +228,35 @@ acquire_lock() {
     return 0
   fi
   other_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  echo "Error: lock $lock_dir is held (owner PID '${other_pid:-unknown}')." >&2
   if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
-    echo "Error: another bw-export.sh (PID $other_pid) is running. Aborting." >&2
-    exit 1
+    echo "Another bw-export.sh appears to be running. Aborting." >&2
+  else
+    echo "That PID is not running, so the lock is probably stale (e.g. from a" >&2
+    echo "hard kill). Confirm no bw-export.sh is running, then remove it with:" >&2
+    echo "  rm -rf '$lock_dir'" >&2
   fi
-  echo "Warning: removing stale lock $lock_dir (owner PID '${other_pid:-unknown}' not running)." >&2
-  rm -rf "$lock_dir"
-  if mkdir "$lock_dir" 2>/dev/null; then
-    lock_held=1
-    printf '%s\n' "$$" > "$lock_dir/pid"
-    return 0
-  fi
-  echo "Error: could not acquire lock $lock_dir. Aborting." >&2
   exit 1
 }
 
 # ----
-# Pre-flight checks
+# Mode-specific pre-flight
 # ----
-
-# Ensure all required tools are installed
-for cmd in bw jq gpg zip unzip; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "Error: '$cmd' is not installed. Please install it first." >&2
+require_cmds() {
+  local cmd
+  for cmd in "$@"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Error: '$cmd' is not installed. Please install it first." >&2
+      exit 1
+    fi
+  done
+}
+require_sha256() {
+  if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+    echo "Error: neither 'shasum' nor 'sha256sum' is installed." >&2
     exit 1
   fi
-done
-if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
-  echo "Error: neither 'shasum' nor 'sha256sum' is installed." >&2
-  exit 1
-fi
+}
 
 # Resolve the recipient to exactly one primary key and pick its newest
 # usable encryption-capable (sub)key fingerprint. Encrypting to "<fpr>!"
@@ -257,77 +269,103 @@ fi
 #   fpr record:      field 10 = fingerprint of the preceding pub/sub
 # The newest usable key is chosen by its creation timestamp explicitly;
 # listing order is not relied upon.
-gpg_colons=$(gpg --batch --with-colons --list-keys "$gpg_key" 2>/dev/null) || {
-  echo "Error: GPG key $gpg_key not found in keyring." >&2
-  exit 1
+resolve_gpg_enc_fpr() {
+  local gpg_colons primary_count
+  gpg_colons=$(gpg --batch --with-colons --list-keys "$gpg_key" 2>/dev/null) || {
+    echo "Error: GPG key $gpg_key not found in keyring." >&2
+    exit 1
+  }
+  primary_count=$(printf '%s\n' "$gpg_colons" | grep -c '^pub:' || true)
+  if [ "$primary_count" -ne 1 ]; then
+    echo "Error: GPG key spec '$gpg_key' matches $primary_count primary keys; expected exactly 1." >&2
+    exit 1
+  fi
+  gpg_enc_fpr=$(printf '%s\n' "$gpg_colons" | awk -F: '
+    ($1 == "pub" || $1 == "sub") {
+      want = ($12 ~ /e/ && $2 !~ /^[idren]$/); created = $6 + 0; next
+    }
+    $1 == "fpr" && want {
+      if (fpr == "" || created > best) { best = created; fpr = $10 }
+      want = 0
+    }
+    END { print fpr }')
+  if [ -z "$gpg_enc_fpr" ]; then
+    echo "Error: GPG key $gpg_key has no valid encryption-capable (sub)key." >&2
+    exit 1
+  fi
+  echo "Using GPG encryption key fingerprint $gpg_enc_fpr"
 }
-primary_count=$(printf '%s\n' "$gpg_colons" | grep -c '^pub:' || true)
-if [ "$primary_count" -ne 1 ]; then
-  echo "Error: GPG key spec '$gpg_key' matches $primary_count primary keys; expected exactly 1." >&2
-  exit 1
-fi
-gpg_enc_fpr=$(printf '%s\n' "$gpg_colons" | awk -F: '
-  ($1 == "pub" || $1 == "sub") {
-    want = ($12 ~ /e/ && $2 !~ /^[idren]$/); created = $6 + 0; next
-  }
-  $1 == "fpr" && want {
-    if (fpr == "" || created > best) { best = created; fpr = $10 }
-    want = 0
-  }
-  END { print fpr }')
-if [ -z "$gpg_enc_fpr" ]; then
-  echo "Error: GPG key $gpg_key has no valid encryption-capable (sub)key." >&2
-  exit 1
-fi
-echo "Using GPG encryption key fingerprint $gpg_enc_fpr"
 
 # ----
 # --verify mode: decrypt-test pending '-unverified' exports and rename
-# the local copy and its NAS copy together.
+# the local copy and its NAS copy after all checks pass.
 # ----
+
+# Print the first existing file named $1 in the directories $2..; empty if none.
+find_in_dirs() {
+  local name="$1" d; shift
+  for d in "$@"; do
+    if [ -f "$d/$name" ]; then printf '%s' "$d/$name"; return 0; fi
+  done
+  return 1
+}
+
+# List '-unverified' exports in the given directories (current + archive/).
+list_unverified() {
+  local d
+  for d in "$@"; do
+    [ -d "$d" ] || continue
+    find "$d" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg"
+  done | sort
+}
+
 verify_pending() {
-  local f name verified_name nas_note has_nas candidate rc=0 count=0
+  local f name verified_name dir nas_copy nas_copy_dir local_verified
+  local rc=0 count=0 nas_count=0
+  local local_dirs=("$downloads_dir" "$downloads_dir/archive")
+  local nas_dirs=("$nas_dir" "$nas_dir/archive")
+  local nas_ok=0
+
   if [[ ! -t 0 ]]; then
     echo "Error: --verify needs an interactive session (YubiKey PIN entry)." >&2
     return 1
   fi
   if nas_available; then
-    nas_note="NAS mounted; NAS copies will be renamed too."
+    nas_ok=1
+    echo "NAS mounted; NAS copies will be renamed too."
   else
-    nas_note="NAS not mounted; NAS copies (if any) keep their '-unverified' name until a later --verify with the NAS mounted."
+    echo "NAS not mounted; NAS copies (if any) keep their '-unverified' name until a later --verify with the NAS mounted."
   fi
-  echo "$nas_note"
 
+  # --- Pass 1: local '-unverified' exports (current dir and archive/). ---
+  # Files are renamed in place, wherever they currently live.
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     count=$((count + 1))
+    dir=$(dirname "$f")
     name=$(basename "$f")
     verified_name="${name%-unverified.zip.gpg}.zip.gpg"
-    has_nas=0
-    echo "Verifying $name..."
+    nas_copy=""
+    echo "Verifying $f..."
 
     # --- Phase 1: all checks. Nothing is renamed until every check passes. ---
-
-    # Never overwrite an existing verified file (local or NAS).
-    if [ -e "$downloads_dir/$verified_name" ]; then
-      echo "Error: $downloads_dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
+    if [ -e "$dir/$verified_name" ]; then
+      echo "Error: $dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
       rc=1; continue
     fi
-    if nas_available && [ -f "$nas_dir/$name" ]; then
-      has_nas=1
-      if [ -e "$nas_dir/$verified_name" ]; then
-        echo "Error: $nas_dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
+    if [ "$nas_ok" -eq 1 ] && nas_copy=$(find_in_dirs "$name" "${nas_dirs[@]}"); then
+      nas_copy_dir=$(dirname "$nas_copy")
+      if [ -e "$nas_copy_dir/$verified_name" ]; then
+        echo "Error: $nas_copy_dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
+        rc=1; continue
+      fi
+      # The NAS copy is only considered verified if it is byte-identical to
+      # the local file we are about to decrypt-test.
+      if [ "$(sha256_of "$f")" != "$(sha256_of "$nas_copy")" ]; then
+        echo "Error: NAS copy $nas_copy differs from the local copy (SHA-256 mismatch); nothing renamed." >&2
         rc=1; continue
       fi
     fi
-
-    # The NAS copy is only considered verified if it is byte-identical to
-    # the local file we are about to decrypt-test.
-    if [ "$has_nas" -eq 1 ] && [ "$(sha256_of "$f")" != "$(sha256_of "$nas_dir/$name")" ]; then
-      echo "Error: NAS copy $name differs from the local copy (SHA-256 mismatch); nothing renamed." >&2
-      rc=1; continue
-    fi
-
     if ! gpg --decrypt "$f" >/dev/null 2>&1; then
       echo "Error: $name failed to decrypt — left as-is for inspection." >&2
       rc=1; continue
@@ -335,42 +373,37 @@ verify_pending() {
 
     # --- Phase 2: all checks passed — rename local, then NAS. ---
     # Two separate renames cannot be atomic; if the second fails the NAS
-    # copy stays '-unverified' and the NAS pass below reconciles it later.
-    mv "$f" "$downloads_dir/$verified_name"
-    echo "  local: renamed to $verified_name"
-    if [ "$has_nas" -eq 1 ]; then
-      if mv "$nas_dir/$name" "$nas_dir/$verified_name"; then
-        echo "  nas:   renamed to $verified_name"
+    # copy stays '-unverified' and pass 2 below reconciles it later.
+    mv "$f" "$dir/$verified_name"
+    echo "  local: renamed to $dir/$verified_name"
+    if [ -n "$nas_copy" ]; then
+      if mv "$nas_copy" "$nas_copy_dir/$verified_name"; then
+        echo "  nas:   renamed to $nas_copy_dir/$verified_name"
       else
-        echo "Error: local copy renamed but NAS rename failed; NAS copy remains $name." >&2
+        echo "Error: local copy renamed but NAS rename failed; NAS copy remains $nas_copy." >&2
         rc=1
       fi
     fi
-  done < <(find "$downloads_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg" | sort)
+  done < <(list_unverified "${local_dirs[@]}")
+  [ "$count" -gt 0 ] || echo "No '-unverified' exports found locally (current or archive/)."
 
-  [ "$count" -gt 0 ] || echo "No '-unverified' exports found in $downloads_dir."
-
-  # --- Pass 2: reconcile NAS '-unverified' files whose local copy has ---
-  # --- already been verified (e.g. the NAS was offline at the time).   ---
-  if nas_available; then
-    local nas_count=0 local_verified
+  # --- Pass 2: NAS '-unverified' exports (current dir and archive/) whose ---
+  # --- local copy was verified earlier, e.g. while the NAS was offline.  ---
+  if [ "$nas_ok" -eq 1 ]; then
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       nas_count=$((nas_count + 1))
+      dir=$(dirname "$f")
       name=$(basename "$f")
       verified_name="${name%-unverified.zip.gpg}.zip.gpg"
-      echo "Reconciling NAS copy $name..."
-      if [ -e "$nas_dir/$verified_name" ]; then
-        echo "Error: $nas_dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
+      echo "Reconciling NAS copy $f..."
+      if [ -e "$dir/$verified_name" ]; then
+        echo "Error: $dir/$verified_name already exists; refusing to overwrite. $name left as-is." >&2
         rc=1; continue
       fi
-      # Prefer matching against a verified local copy (current or archived)
+      # Prefer matching against a verified local copy (current or archive/)
       # so the YubiKey is not needed; otherwise decrypt-test the NAS file.
-      local_verified=""
-      for candidate in "$downloads_dir/$verified_name" "$downloads_dir/archive/$verified_name"; do
-        [ -f "$candidate" ] && { local_verified="$candidate"; break; }
-      done
-      if [ -n "$local_verified" ]; then
+      if local_verified=$(find_in_dirs "$verified_name" "${local_dirs[@]}"); then
         if [ "$(sha256_of "$local_verified")" != "$(sha256_of "$f")" ]; then
           echo "Error: NAS copy $name differs from verified local copy $local_verified (SHA-256 mismatch); left as-is." >&2
           rc=1; continue
@@ -382,22 +415,33 @@ verify_pending() {
         echo "Error: no local copy and NAS copy $name failed to decrypt — left as-is." >&2
         rc=1; continue
       fi
-      mv "$f" "$nas_dir/$verified_name"
-      echo "  nas:   renamed to $verified_name"
-    done < <(find "$nas_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg" | sort)
-    [ "$nas_count" -gt 0 ] || echo "No '-unverified' exports left on NAS."
+      mv "$f" "$dir/$verified_name"
+      echo "  nas:   renamed to $dir/$verified_name"
+    done < <(list_unverified "${nas_dirs[@]}")
+    [ "$nas_count" -gt 0 ] || echo "No '-unverified' exports left on NAS (current or archive/)."
   fi
 
   return "$rc"
 }
 
+# ----
+# Mode dispatch — parsed before any tool/key checks so each mode only
+# demands what it actually uses.
+# ----
 case "${1:-}" in
   --verify)
+    # Needs only gpg (decrypt) and a SHA-256 tool; no bw/jq/zip/unzip and
+    # no encryption-key resolution.
+    require_cmds gpg
+    require_sha256
     acquire_lock
     verify_pending
     exit $?
     ;;
   "")
+    require_cmds bw jq gpg zip unzip
+    require_sha256
+    resolve_gpg_enc_fpr
     acquire_lock
     ;;
   *)
