@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.1
+# Version: 1.3.2
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -15,8 +15,17 @@
 # interactive session. Unattended runs (cron/launchd) ARE allowed to become
 # the current backup — an unverified backup beats none — but are named
 # bw-auto-export-<ts>-unverified.zip.gpg so they are never mistaken for a
-# recovery-tested one. Verify later with 'gpg --decrypt <file> >/dev/null'
-# and drop the '-unverified' suffix.
+# recovery-tested one. Run './bw-export.sh --verify' later (with the
+# YubiKey present): it decrypt-tests every '-unverified' export and renames
+# BOTH the local copy and its NAS copy (after confirming they are identical).
+# If the NAS is not mounted at that time, the NAS copy keeps its
+# '-unverified' name until a later '--verify' run finds it mounted.
+#
+# v1.3.2:
+#   - GPG encryption subkey is chosen by explicit creation timestamp
+#     (field 6), not by listing order.
+#   - New '--verify' mode: decrypt-tests '-unverified' exports and renames
+#     the local and NAS copies together.
 #
 # v1.3.1:
 #   - Unverified (non-interactive) exports are installed/replicated under a
@@ -51,7 +60,10 @@
 #
 # Requirements: bw (Bitwarden CLI), jq, gpg, zip, unzip,
 #               shasum or sha256sum
-# Usage: run interactively with the vault unlocked (bw unlock).
+# Usage:
+#   bw-export.sh            run an export (interactive: vault unlock + decrypt test)
+#   bw-export.sh --verify   decrypt-test pending '-unverified' exports and
+#                           rename local + NAS copies (needs YubiKey + TTY)
 #
 set -Eeuo pipefail
 
@@ -113,6 +125,18 @@ sha256_of() {
   fi
 }
 
+# True if $nas_mount is an actual mount point (not merely a directory left
+# behind on the local disk) and $nas_dir exists under it.
+# 'df -P' reports the filesystem's mount point in the last column. No '--'
+# is passed: $nas_mount is a fixed absolute path (cannot look like an
+# option) and the native macOS df does not reliably accept '--'.
+nas_available() {
+  local mounted_on
+  [ -d "$nas_mount" ] || return 1
+  mounted_on=$(df -P "$nas_mount" 2>/dev/null | awk 'NR == 2 {print $NF}')
+  [ "$mounted_on" = "$nas_mount" ] && [ -d "$nas_dir" ]
+}
+
 # Lock the vault only if *this script* unlocked it, then drop the session
 # key from our environment. Idempotent; safe to call from the EXIT trap.
 script_unlocked=0
@@ -168,9 +192,11 @@ fi
 # explicit trust model, avoids interactive prompts.
 #
 # --with-colons record layout (see gnupg/doc/DETAILS):
-#   pub/sub records: field 2 = validity, field 12 = key capabilities
+#   pub/sub records: field 2 = validity, field 6 = creation time (epoch),
+#                    field 12 = key capabilities (lowercase = own capability)
 #   fpr record:      field 10 = fingerprint of the preceding pub/sub
-# gpg lists subkeys in creation order, so the last match is the newest.
+# The newest usable key is chosen by its creation timestamp explicitly;
+# listing order is not relied upon.
 gpg_colons=$(gpg --batch --with-colons --list-keys "$gpg_key" 2>/dev/null) || {
   echo "Error: GPG key $gpg_key not found in keyring." >&2
   exit 1
@@ -181,14 +207,80 @@ if [ "$primary_count" -ne 1 ]; then
   exit 1
 fi
 gpg_enc_fpr=$(printf '%s\n' "$gpg_colons" | awk -F: '
-  ($1 == "pub" || $1 == "sub") { want = ($12 ~ /e/ && $2 !~ /^[idren]$/); next }
-  $1 == "fpr" && want          { fpr = $10; want = 0 }
-  END                          { print fpr }')
+  ($1 == "pub" || $1 == "sub") {
+    want = ($12 ~ /e/ && $2 !~ /^[idren]$/); created = $6 + 0; next
+  }
+  $1 == "fpr" && want {
+    if (fpr == "" || created > best) { best = created; fpr = $10 }
+    want = 0
+  }
+  END { print fpr }')
 if [ -z "$gpg_enc_fpr" ]; then
   echo "Error: GPG key $gpg_key has no valid encryption-capable (sub)key." >&2
   exit 1
 fi
 echo "Using GPG encryption key fingerprint $gpg_enc_fpr"
+
+# ----
+# --verify mode: decrypt-test pending '-unverified' exports and rename
+# the local copy and its NAS copy together.
+# ----
+verify_pending() {
+  local f name verified_name nas_note rc=0 count=0
+  if [[ ! -t 0 ]]; then
+    echo "Error: --verify needs an interactive session (YubiKey PIN entry)." >&2
+    return 1
+  fi
+  if nas_available; then
+    nas_note="NAS mounted; NAS copies will be renamed too."
+  else
+    nas_note="NAS not mounted; NAS copies (if any) keep their '-unverified' name until a later --verify."
+  fi
+  echo "$nas_note"
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    count=$((count + 1))
+    name=$(basename "$f")
+    verified_name="${name%-unverified.zip.gpg}.zip.gpg"
+    echo "Verifying $name..."
+    if ! gpg --decrypt "$f" >/dev/null 2>&1; then
+      echo "Error: $name failed to decrypt — left as-is for inspection." >&2
+      rc=1
+      continue
+    fi
+    mv "$f" "$downloads_dir/$verified_name"
+    echo "  local: renamed to $verified_name"
+
+    if nas_available && [ -f "$nas_dir/$name" ]; then
+      # Only rename the NAS copy if it is byte-identical to the file we
+      # actually decrypt-tested; otherwise it has not been verified.
+      if [ "$(sha256_of "$downloads_dir/$verified_name")" = "$(sha256_of "$nas_dir/$name")" ]; then
+        mv "$nas_dir/$name" "$nas_dir/$verified_name"
+        echo "  nas:   renamed to $verified_name"
+      else
+        echo "Error: NAS copy $name differs from the verified local copy (SHA-256 mismatch); NAS copy left as '-unverified'." >&2
+        rc=1
+      fi
+    fi
+  done < <(find "$downloads_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg" | sort)
+
+  [ "$count" -gt 0 ] || echo "No '-unverified' exports found in $downloads_dir."
+  return "$rc"
+}
+
+case "${1:-}" in
+  --verify)
+    verify_pending
+    exit $?
+    ;;
+  "")
+    ;;
+  *)
+    echo "Usage: $0 [--verify]" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "$downloads_dir/archive"
 
@@ -324,8 +416,8 @@ if [[ ! -t 0 ]]; then
   final_name="${zip_file%.zip}-unverified.zip.gpg"
   echo "Warning: non-interactive session — decrypt verification skipped." >&2
   echo "Export will be installed as $final_name (NOT recovery-tested)." >&2
-  echo "Verify with: gpg --decrypt '$downloads_dir/$final_name' >/dev/null" >&2
-  echo "then rename it to '$zip_file.gpg'." >&2
+  echo "Run '$0 --verify' with the YubiKey present to decrypt-test it and" >&2
+  echo "rename the local and NAS copies to '$zip_file.gpg'." >&2
 else
   if gpg --decrypt "$random_dir/$zip_file.gpg" >/dev/null 2>&1; then
     echo "Decryption test passed."
@@ -353,18 +445,7 @@ echo "Encrypted export saved to $downloads_dir/$final_name"
 # ----
 # Copy to NAS if mounted
 # ----
-# Check that $nas_mount is an actual mount point (not merely a directory
-# left behind on the local disk) before touching anything under it.
-# 'df -P' reports the filesystem's mount point in the last column. No '--'
-# is passed: $nas_mount is a fixed absolute path (cannot look like an
-# option) and the native macOS df does not reliably accept '--'.
-nas_mounted=0
-if [ -d "$nas_mount" ]; then
-  mounted_on=$(df -P "$nas_mount" 2>/dev/null | awk 'NR == 2 {print $NF}')
-  [ "$mounted_on" = "$nas_mount" ] && nas_mounted=1
-fi
-
-if [ "$nas_mounted" -eq 1 ] && [ -d "$nas_dir" ]; then
+if nas_available; then
   mkdir -p "$nas_dir/archive"
   echo "Copying $final_name to $nas_dir"
   cp "$downloads_dir/$final_name" "$nas_dir/"
