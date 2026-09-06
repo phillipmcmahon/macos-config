@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.5
+# Version: 1.3.6
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -23,6 +23,14 @@
 # in a second pass (hash-matched against the verified local copy, or
 # decrypt-tested directly if no local copy remains). Both passes cover the
 # current directory and archive/.
+#
+# v1.3.6:
+#   - Lock is released as the very last step of cleanup(), after the
+#     plaintext staging directory has been wiped.
+#   - --verify captures the '-unverified' file list up front so a failing
+#     'find' aborts the run instead of silently yielding an empty list.
+#   - Rotation into archive/ never overwrites: an existing identically
+#     named archive file aborts before anything is moved.
 #
 # v1.3.5:
 #   - Lock is never removed automatically (the check-PID/rm/mkdir sequence
@@ -169,6 +177,32 @@ nas_available() {
   [ "$mounted_on" = "$nas_mount" ] && [ -d "$nas_dir" ]
 }
 
+# Move every bw-auto-export-*.zip.gpg in $1 (except an optional $2) into
+# $1/archive/, refusing to overwrite. All collisions are detected before
+# anything is moved, so a refusal leaves the directory untouched.
+rotate_into_archive() {
+  local dir="$1" keep="${2:-}" f name collisions=0
+  local listing
+  # Explicit '|| return 1': errexit is suspended inside an 'if !' condition.
+  listing=$(find "$dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*.zip.gpg" | sort) || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    name=$(basename "$f")
+    [ "$name" != "$keep" ] || continue
+    if [ -e "$dir/archive/$name" ]; then
+      echo "Error: $dir/archive/$name already exists; refusing to overwrite it during rotation." >&2
+      collisions=$((collisions + 1))
+    fi
+  done <<< "$listing"
+  [ "$collisions" -eq 0 ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    name=$(basename "$f")
+    [ "$name" != "$keep" ] || continue
+    mv "$f" "$dir/archive/$name"
+  done <<< "$listing"
+}
+
 # Lock the vault only if *this script* unlocked it, then drop the session
 # key from our environment. Idempotent; safe to call from the EXIT trap.
 script_unlocked=0
@@ -191,9 +225,6 @@ lock_held=0
 cleanup() {
   set +e  # cleanup is best-effort; never abort mid-wipe
   finish_bw_session
-  if [ "$lock_held" -eq 1 ]; then
-    rm -rf "$lock_dir"
-  fi
   if [ -n "$random_dir" ] && [ -d "$random_dir" ]; then
     # See secure_rm_file for the APFS caveat.
     if command -v shred >/dev/null 2>&1; then
@@ -202,6 +233,11 @@ cleanup() {
       find "$random_dir" -type f -exec rm -P {} \;
     fi
     rm -rf "$random_dir"
+  fi
+  # Release the lock last, only once all plaintext has been wiped, so a
+  # concurrent run can never start while staging data still exists.
+  if [ "$lock_held" -eq 1 ]; then
+    rm -rf "$lock_dir"
   fi
 }
 # Signals only trigger an exit (with the conventional 128+signal status);
@@ -310,12 +346,15 @@ find_in_dirs() {
   return 1
 }
 
-# List '-unverified' exports in the given directories (current + archive/).
+# List '-unverified' exports in the given directories (current + archive/),
+# one path per line. Callers capture the output with $(...) BEFORE looping
+# so that a failing 'find' propagates through 'set -e' rather than being
+# lost inside a process substitution.
 list_unverified() {
   local d
   for d in "$@"; do
     [ -d "$d" ] || continue
-    find "$d" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg"
+    find "$d" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*-unverified.zip.gpg" || return 1
   done | sort
 }
 
@@ -324,7 +363,7 @@ verify_pending() {
   local rc=0 count=0 nas_count=0
   local local_dirs=("$downloads_dir" "$downloads_dir/archive")
   local nas_dirs=("$nas_dir" "$nas_dir/archive")
-  local nas_ok=0
+  local nas_ok=0 local_pending nas_pending
 
   if [[ ! -t 0 ]]; then
     echo "Error: --verify needs an interactive session (YubiKey PIN entry)." >&2
@@ -339,6 +378,7 @@ verify_pending() {
 
   # --- Pass 1: local '-unverified' exports (current dir and archive/). ---
   # Files are renamed in place, wherever they currently live.
+  local_pending=$(list_unverified "${local_dirs[@]}")
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     count=$((count + 1))
@@ -384,12 +424,13 @@ verify_pending() {
         rc=1
       fi
     fi
-  done < <(list_unverified "${local_dirs[@]}")
+  done <<< "$local_pending"
   [ "$count" -gt 0 ] || echo "No '-unverified' exports found locally (current or archive/)."
 
   # --- Pass 2: NAS '-unverified' exports (current dir and archive/) whose ---
   # --- local copy was verified earlier, e.g. while the NAS was offline.  ---
   if [ "$nas_ok" -eq 1 ]; then
+    nas_pending=$(list_unverified "${nas_dirs[@]}")
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       nas_count=$((nas_count + 1))
@@ -417,7 +458,7 @@ verify_pending() {
       fi
       mv "$f" "$dir/$verified_name"
       echo "  nas:   renamed to $dir/$verified_name"
-    done < <(list_unverified "${nas_dirs[@]}")
+    done <<< "$nas_pending"
     [ "$nas_count" -gt 0 ] || echo "No '-unverified' exports left on NAS (current or archive/)."
   fi
 
@@ -610,8 +651,10 @@ fi
 # current here and the previous (possibly verified) export is rotated into
 # archive/. It is not deleted, and the '-unverified' name makes the
 # distinction visible until '--verify' has been run.
-find "$downloads_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*.zip.gpg" \
-  -exec mv {} "$downloads_dir/archive/" \;
+if ! rotate_into_archive "$downloads_dir"; then
+  echo "Error: local rotation aborted; new export left in staging and will be wiped. Previous export untouched." >&2
+  exit 1
+fi
 mv "$random_dir/$zip_file.gpg" "$downloads_dir/$final_name"
 echo "Encrypted export saved to $downloads_dir/$final_name"
 
@@ -637,8 +680,10 @@ if nas_available; then
   echo "NAS copy verified (SHA-256 $src_sha)."
 
   # Rotate everything except the file we just copied.
-  find "$nas_dir" -mindepth 1 -maxdepth 1 -type f -name "bw-auto-export-*.zip.gpg" \
-    ! -name "$final_name" -exec mv {} "$nas_dir/archive/" \;
+  if ! rotate_into_archive "$nas_dir" "$final_name"; then
+    echo "Error: NAS rotation aborted; new NAS copy $final_name kept alongside the previous export(s)." >&2
+    exit 1
+  fi
 else
   echo "NAS not mounted at $nas_mount (or $nas_dir missing) — skipping NAS copy."
 fi
