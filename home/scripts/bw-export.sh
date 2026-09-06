@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.8
+# Version: 1.3.9
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -23,6 +23,10 @@
 # in a second pass (hash-matched against the verified local copy, or
 # decrypt-tested directly if no local copy remains). Both passes cover the
 # current directory and archive/.
+#
+# v1.3.9:
+#   - Guard against TMPDIR=/ edge case: trailing-slash strip is skipped
+#     when TMPDIR is exactly '/' to avoid producing an empty string.
 #
 # v1.3.8:
 #   - Only items that actually have attachments get a directory in the
@@ -540,7 +544,7 @@ esac
 # iCloud; nothing beyond that is assumed about its lifecycle or filesystem.
 # Falls back to /tmp if $TMPDIR is unset.
 tmp_root="${TMPDIR:-/tmp}"
-tmp_root="${tmp_root%/}"  # macOS sets TMPDIR with a trailing slash
+[[ "$tmp_root" != "/" ]] && tmp_root="${tmp_root%/}"  # macOS sets TMPDIR with a trailing slash
 random_dir=$(mktemp -d "$tmp_root/bw_export_XXXXXXXXXX")
 
 # ----
