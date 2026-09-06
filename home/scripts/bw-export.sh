@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.6
+# Version: 1.3.7
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -23,6 +23,10 @@
 # in a second pass (hash-matched against the verified local copy, or
 # decrypt-tested directly if no local copy remains). Both passes cover the
 # current directory and archive/.
+#
+# v1.3.7:
+#   - Both local and NAS installation refuse to proceed if a file with the
+#     target name already exists, preventing silent overwrites.
 #
 # v1.3.6:
 #   - Lock is released as the very last step of cleanup(), after the
@@ -651,6 +655,10 @@ fi
 # current here and the previous (possibly verified) export is rotated into
 # archive/. It is not deleted, and the '-unverified' name makes the
 # distinction visible until '--verify' has been run.
+if [ -e "$downloads_dir/$final_name" ]; then
+  echo "Error: $downloads_dir/$final_name already exists; refusing to overwrite. New export left in staging and will be wiped." >&2
+  exit 1
+fi
 if ! rotate_into_archive "$downloads_dir"; then
   echo "Error: local rotation aborted; new export left in staging and will be wiped. Previous export untouched." >&2
   exit 1
@@ -663,6 +671,10 @@ echo "Encrypted export saved to $downloads_dir/$final_name"
 # ----
 if nas_available; then
   mkdir -p "$nas_dir/archive"
+  if [ -e "$nas_dir/$final_name" ]; then
+    echo "Error: $nas_dir/$final_name already exists; refusing to overwrite. NAS copy skipped." >&2
+    exit 1
+  fi
   echo "Copying $final_name to $nas_dir"
   cp "$downloads_dir/$final_name" "$nas_dir/"
 
