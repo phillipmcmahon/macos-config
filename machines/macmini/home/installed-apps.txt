@@ -1,0 +1,75 @@
+Adguard
+AdGuard VPN
+AltTab
+Arpeggi
+Arq
+Audio Hijack
+balenaEtcher
+Bitwarden
+Carbon Copy Cloner
+Citrix Workspace
+Cyberduck
+DaisyDisk
+Deskflow
+Dolphin
+DuckStation
+Emby
+Firefox
+Firewalla
+ForkLift
+Google Chrome
+HandBrake
+IINA
+Infuse
+IPTVnator
+Jiggler
+Jump Desktop
+LaunchBar
+Little Snitch
+Loopback
+Lume
+MakeMKV
+MarkEdit
+Microsoft 365 Copilot Shim
+Microsoft Defender Shim
+Microsoft Excel
+Microsoft OneNote
+Microsoft Outlook
+Microsoft PowerPoint
+Microsoft Teams
+Microsoft Word
+Mimestream
+Moom
+Mp3tag
+Mullvad VPN
+NeoStation
+Nextcloud
+OneDrive
+OpenAudible
+OpenLogi
+Pacifist
+Passepartout
+Plex
+Pure Paste
+qBittorrent
+RetroArch
+Rocket
+Safari
+Sentinel
+Shottr
+SMBMounter
+SoundSource
+SpotiFLAC-Next
+Spotify
+SSH Config Editor
+Synergy
+Tailscale
+TestFlight
+The Unarchiver
+UniFi Endpoint
+VLC
+Vorssaint
+XeniOS
+Yubico Authenticator
+ZoomVDI
+ZoomVDIUninstaller
