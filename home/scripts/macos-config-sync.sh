@@ -2,17 +2,79 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.2.0
+# Version: 2.4.1
+#
+# v2.4.1:
+#   - Fixed (High): Staleness guard A handler now applies the same three-
+#     way model as M. A remote-added file with a different local file is a
+#     conflict (local != new), not a silent allow.
+#   - Fixed (High): Staleness guard D handler now treats a remote deletion
+#     combined with independent local edits (local != old blob) as a
+#     conflict, rather than silently allowing the push to resurrect the
+#     file.
+#   - Fixed (Low): Staleness guard documentation block rewritten to
+#     describe the current three-way (local / old / new) conflict model
+#     and all five status outcomes.
+#   - Fixed (Low): Staleness guard error messages no longer assume local
+#     copies are "older" — the wording now reflects the general conflict
+#     case.
+#
+# v2.4.0:
+#   - Fixed (High): Staleness guard now detects concurrent-edit conflicts.
+#     When a file was modified both locally and by the remote (local != old
+#     AND local != new), the v2.3.0 guard allowed the push — silently
+#     overwriting the remote version. Both local edits and remote edits are
+#     now treated as a conflict requiring explicit resolution.
+#   - Fixed (High): Staleness guard now detects local-deletion / remote-
+#     modification conflicts. If a file was deleted locally but modified on
+#     the remote, the push would delete the remote version. This is now
+#     treated as a conflict.
+#   - Fixed (Medium): Secret scanner no longer stores Git blobs in Bash
+#     variables. Bash variables cannot represent NUL bytes, so binary blobs
+#     were silently truncated. The scanner now streams git show directly
+#     into grep without an intermediate variable.
+#   - Fixed (Low): Corrected the dependency list — removed xargs (no longer
+#     used after the v2.3.0 installed-apps fix) and added grep and basename
+#     which are used but were not checked.
+#   - Fixed (Low): Added --no-renames to the staleness guard's git diff so
+#     rename status lines (Rxx) cannot reach the M/A/D case handler.
+#
+# v2.3.0:
+#   - Fixed (Critical): Staleness guard redesigned. The v2.2.0 guard
+#     compared $HOME files directly against the post-rebase repository,
+#     which meant normal local edits (the whole point of push) were
+#     flagged as unrestored remote changes. The guard now captures the
+#     pre-rebase HEAD, diffs it against the post-rebase HEAD to identify
+#     files actually changed by the remote, and for each such file
+#     compares the local $HOME copy against the OLD (pre-rebase) blob.
+#     A file is only flagged stale when the local copy is byte-identical
+#     to the pre-rebase version — meaning the user never incorporated
+#     the remote change. Independent local edits are left alone.
+#   - Fixed (Critical): The secret scanner's combined grep pattern
+#     begins with '-----BEGIN' and grep interpreted the leading dashes
+#     as option flags, silently skipping the content scan. All grep
+#     invocations that accept a variable pattern now use -e to force
+#     pattern interpretation (grep -qE -e "$pattern").
+#   - Fixed (High): Remote deletions are now detected by the staleness
+#     guard. If Machine A deletes a managed file and pushes, Machine B's
+#     staleness guard will flag the local copy that still matches the
+#     pre-deletion blob — preventing silent resurrection.
+#   - Fixed (Medium): validate_dependencies() now checks for cmp, sed,
+#     xargs, wc, paste, cut and tr — all used later but previously
+#     unvalidated.
+#   - Fixed (Medium): The secret scanner now reads staged Git blobs
+#     (git show :path) instead of working-tree files. The previous
+#     approach could miss staged content that differed from the working
+#     tree, or scan working-tree changes that were not actually staged.
+#   - Fixed (Low): generate_installed_apps_list() replaced the
+#     find | xargs -0 -n1 basename pipeline with a while-read loop.
+#     The xargs pipeline ran basename with no arguments when /Applications
+#     contained no .app bundles, which fails under set -e on macOS.
 #
 # v2.2.0:
 #   - New staleness guard: check_for_unrestored_remote_changes() runs after
-#     rebase and before collect. It compares the post-rebase repository
-#     copies of shared managed files and directories against the local
-#     copies in $HOME. If the repository (which now includes remote changes
-#     brought in by the rebase) differs from the local files, those are
-#     remote changes that have never been restored — pushing would silently
-#     overwrite them. The push is aborted with a clear list of stale files
-#     and a recommendation to run pull first.
+#     rebase and before collect. Compares managed files against the
+#     repository to detect unrestored remote changes.
 #   - Escape hatch: set FORCE_PUSH=1 to push anyway when the staleness
 #     guard fires (for cases where you intentionally want to overwrite).
 #   - FORCE_PUSH is validated alongside DRY_RUN in validate_configuration.
@@ -157,7 +219,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.4.1"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -386,6 +448,12 @@ repository_path() {
 # Resolved once by ensure_machine_name(); used for all machine-specific paths.
 MACHINE=""
 
+# Set by update_from_remote_before_push() to the commit hash before the
+# rebase. Used by check_for_unrestored_remote_changes() to identify which
+# files were actually changed by the remote — so that only genuinely
+# unrestored changes are flagged, not normal local edits.
+PRE_REBASE_HEAD=""
+
 ensure_machine_name() {
     [[ -n "$MACHINE" ]] || MACHINE="$(detect_machine_name)"
 }
@@ -521,6 +589,14 @@ validate_dependencies() {
     require_command find
     require_command sort
     require_command head
+    require_command cmp
+    require_command sed
+    require_command grep
+    require_command basename
+    require_command wc
+    require_command paste
+    require_command cut
+    require_command tr
 }
 
 validate_managed_path() {
@@ -1039,10 +1115,16 @@ generate_installed_apps_list() {
         return 0
     fi
 
-    find /Applications -maxdepth 1 -name '*.app' -print0 |
-        xargs -0 -n1 basename |
-        sed 's/\.app$//' |
-        LC_ALL=C sort -f >"$output_file"
+    # Use a while-read loop instead of xargs to handle the case where
+    # /Applications contains no .app bundles.  macOS xargs lacks GNU
+    # --no-run-if-empty, so the previous pipeline ran basename with no
+    # arguments — which fails under set -e.
+    local app
+    (
+        while IFS= read -r -d '' app; do
+            basename "$app" .app
+        done < <(find /Applications -maxdepth 1 -name '*.app' -print0)
+    ) | LC_ALL=C sort -f >"$output_file"
 
     log "Listed $(wc -l < "$output_file" | tr -d ' ') applications"
 }
@@ -1133,7 +1215,10 @@ if [[ "$DRY_RUN" == "1" ]]; then
     return 0
 fi
 
+# Record the current HEAD before the rebase so the staleness guard can
+# diff against it later to identify files actually changed by the remote.
 if repository_has_commits; then
+    PRE_REBASE_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD)"
     git -C "$REPO_DIR" rebase "origin/$GIT_BRANCH"
 else
     git -C "$REPO_DIR" checkout \
@@ -1260,7 +1345,7 @@ scan_for_secrets() {
     log "Scanning staged files for secret material"
 
     local -i findings=0
-    local pattern file relative_path
+    local pattern relative_path
 
     local combined_pattern
     combined_pattern=$(printf '%s\n' "${SECRET_CONTENT_PATTERNS[@]}" | paste -sd'|' -)
@@ -1282,9 +1367,6 @@ scan_for_secrets() {
     fi
 
     for relative_path in "${staged_files[@]}"; do
-        file="$REPO_DIR/$relative_path"
-        [[ -f "$file" ]] || continue
-
         # Check filename against suspicious patterns
         for pattern in "${SECRET_FILENAME_PATTERNS[@]}"; do
             if [[ "$relative_path" =~ $pattern ]]; then
@@ -1294,19 +1376,30 @@ scan_for_secrets() {
             fi
         done
 
+        # Stream the staged blob directly from the Git index into grep
+        # rather than capturing it into a Bash variable.  Bash variables
+        # cannot safely represent NUL bytes, so binary blobs would be
+        # silently truncated — corrupting the content scan.
+
         # Skip binary files.  grep -Iq reads the first buffer and exits
         # quietly if it finds a NUL byte — unlike the previous MIME-based
         # check, this correctly treats application/json (and other
         # structured-text MIME types) as scannable text.
-        if ! grep -Iq '' "$file" 2>/dev/null; then
+        if ! git -C "$REPO_DIR" show ":$relative_path" 2>/dev/null |
+            grep -Iq '' 2>/dev/null; then
             continue
         fi
 
-        if grep -qE "$combined_pattern" "$file" 2>/dev/null; then
+        # Use -e to force pattern interpretation — several patterns begin
+        # with '-----BEGIN' whose leading dashes grep otherwise parses as
+        # option flags.
+        if git -C "$REPO_DIR" show ":$relative_path" 2>/dev/null |
+            grep -qE -e "$combined_pattern" 2>/dev/null; then
             warn "Possible secret content in: $relative_path"
             # Show which pattern matched (without revealing the secret value)
             for pattern in "${SECRET_CONTENT_PATTERNS[@]}"; do
-                if grep -qE "$pattern" "$file" 2>/dev/null; then
+                if git -C "$REPO_DIR" show ":$relative_path" 2>/dev/null |
+                    grep -qE -e "$pattern" 2>/dev/null; then
                     warn "  matched pattern: $pattern"
                 fi
             done
@@ -1332,22 +1425,32 @@ scan_for_secrets() {
 # Staleness guard
 # ----
 #
-# After the rebase brings in remote changes, the repository's home/ and
-# machines/$MACHINE/home/ trees may contain files that are newer than the
-# local copies in $HOME. If the user has not run pull since those changes
-# landed, collect_local_files would silently overwrite the newer remote
-# versions with the stale local copies. This function detects that
-# situation and aborts the push with a clear list of affected files.
+# Prevents a push from silently overwriting or discarding remote changes
+# that the user has not yet incorporated locally.
 #
-# The check covers:
-#   - Shared managed files (MANAGED_FILES)
-#   - Shared managed directories (MANAGED_DIRECTORIES) — files inside
-#     the repository directory that differ from or do not exist locally
-#   - Machine-specific files (MACHINE_FILES)
-#   - Machine-specific directories (MACHINE_DIRECTORIES)
+# After rebase, the guard diffs PRE_REBASE_HEAD (old) against the current
+# HEAD (new) to find files the remote changed. For each such file it
+# performs a three-way comparison — local copy vs old blob vs new blob —
+# and classifies the result:
 #
-# The FORCE_PUSH=1 escape hatch bypasses the guard for cases where the
-# user intentionally wants to overwrite the remote versions.
+#   M (modified on remote):
+#     local == old          → stale (user never pulled the update)
+#     local == new          → safe  (user already has the remote version)
+#     local != old != new   → conflict (both sides edited independently)
+#     local missing         → conflict (deleted locally, modified on remote)
+#
+#   A (added on remote):
+#     local missing         → stale (remote addition not yet restored)
+#     local == new          → safe  (user already has the same content)
+#     local != new          → conflict (local file differs from remote add)
+#
+#   D (deleted on remote):
+#     local == old          → stale (pushing would resurrect deleted file)
+#     local != old          → conflict (local edits vs remote deletion)
+#     local missing         → safe  (both sides agree)
+#
+# Any stale or conflicting file aborts the push. The FORCE_PUSH=1 escape
+# hatch bypasses the guard when the user intentionally wants to overwrite.
 
 check_for_unrestored_remote_changes() {
     require_repository
@@ -1357,86 +1460,111 @@ check_for_unrestored_remote_changes() {
         return 0
     fi
 
-    # Nothing to compare if there is no history yet.
-    repository_has_commits || return 0
-    git -C "$REPO_DIR" show-ref --verify --quiet \
-        "refs/remotes/origin/$GIT_BRANCH" 2>/dev/null || return 0
+    # PRE_REBASE_HEAD is set by update_from_remote_before_push() just
+    # before the rebase. If it is empty the rebase was skipped (no
+    # remote branch, no commits, or DRY_RUN) — nothing to check.
+    [[ -n "$PRE_REBASE_HEAD" ]] || return 0
+
+    local post_rebase_head
+    post_rebase_head="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || return 0
+
+    # If HEAD did not move, the rebase introduced no remote changes.
+    if [[ "$PRE_REBASE_HEAD" == "$post_rebase_head" ]]; then
+        log "Staleness guard passed — no remote changes in rebase"
+        return 0
+    fi
+
+    ensure_machine_name
 
     local -a stale_files=()
-    local path repo_file local_file
+    local status repo_path
 
-    # --- Shared managed files ---
-    for path in "${MANAGED_FILES[@]}"; do
-        repo_file="$(repository_path "$path")"
-        local_file="$(local_path "$path")"
-        if [[ -f "$repo_file" && -f "$local_file" ]]; then
-            if ! cmp -s "$repo_file" "$local_file"; then
-                stale_files+=("~/$path")
-            fi
-        elif [[ -f "$repo_file" && ! -e "$local_file" ]]; then
-            # Remote added a file that does not exist locally.
-            stale_files+=("~/$path (new from remote)")
-        fi
-    done
+    # Enumerate files changed between the old and new HEAD. Only paths
+    # under home/ or this machine's tree are relevant — everything else
+    # (README.md, .gitignore, other machines' trees) is skipped.
+    while IFS=$'\t' read -r status repo_path; do
+        [[ -n "$repo_path" ]] || continue
 
-    # --- Shared managed directories ---
-    for path in "${MANAGED_DIRECTORIES[@]}"; do
-        local repo_dir local_dir
-        repo_dir="$(repository_path "$path")"
-        local_dir="$(local_path "$path")"
-        [[ -d "$repo_dir" ]] || continue
+        local home_relative=""
+        case "$repo_path" in
+            home/*)
+                home_relative="${repo_path#home/}"
+                ;;
+            machines/"$MACHINE"/home/*)
+                home_relative="${repo_path#machines/"$MACHINE"/home/}"
+                ;;
+            *)
+                continue
+                ;;
+        esac
 
-        while IFS= read -r -d '' repo_file; do
-            local relative="${repo_file#"$repo_dir"/}"
-            local_file="$local_dir/$relative"
-            if [[ -f "$repo_file" ]]; then
-                if [[ ! -f "$local_file" ]]; then
-                    stale_files+=("~/$path/$relative (new from remote)")
-                elif ! cmp -s "$repo_file" "$local_file"; then
-                    stale_files+=("~/$path/$relative")
+        local local_file
+        local_file="$(local_path "$home_relative")"
+
+        case "$status" in
+            M)
+                # Modified by the remote.
+                if [[ ! -e "$local_file" ]]; then
+                    # File was deleted locally but modified on the remote.
+                    # Pushing would delete the remote version — conflict.
+                    stale_files+=("~/$home_relative (deleted locally, modified on remote)")
+                elif [[ -f "$local_file" ]]; then
+                    # Compare local against the OLD (pre-rebase) blob.
+                    if git -C "$REPO_DIR" show "$PRE_REBASE_HEAD:$repo_path" 2>/dev/null |
+                        cmp -s - "$local_file"; then
+                        # Local == old: user never incorporated the remote
+                        # change — stale.
+                        stale_files+=("~/$home_relative")
+                    elif ! git -C "$REPO_DIR" show "$post_rebase_head:$repo_path" 2>/dev/null |
+                        cmp -s - "$local_file"; then
+                        # Local != old AND local != new: both sides
+                        # changed the file independently — conflict.
+                        stale_files+=("~/$home_relative (conflicting local and remote edits)")
+                    fi
+                    # Local == new: user already has the remote version
+                    # (or made identical edits) — safe to push.
                 fi
-            fi
-        done < <(find "$repo_dir" -type f -print0)
-    done
-
-    # --- Machine-specific files ---
-    ensure_machine_name
-    for path in "${MACHINE_FILES[@]}"; do
-        repo_file="$(machine_repository_path "$path")"
-        local_file="$(local_path "$path")"
-        if [[ -f "$repo_file" && -f "$local_file" ]]; then
-            if ! cmp -s "$repo_file" "$local_file"; then
-                stale_files+=("~/$path (machine: $MACHINE)")
-            fi
-        elif [[ -f "$repo_file" && ! -e "$local_file" ]]; then
-            stale_files+=("~/$path (machine: $MACHINE, new from remote)")
-        fi
-    done
-
-    # --- Machine-specific directories ---
-    for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
-        local repo_dir local_dir
-        repo_dir="$(machine_repository_path "$path")"
-        local_dir="$(local_path "$path")"
-        [[ -d "$repo_dir" ]] || continue
-
-        while IFS= read -r -d '' repo_file; do
-            local relative="${repo_file#"$repo_dir"/}"
-            local_file="$local_dir/$relative"
-            if [[ -f "$repo_file" ]]; then
-                if [[ ! -f "$local_file" ]]; then
-                    stale_files+=("~/$path/$relative (machine: $MACHINE, new from remote)")
-                elif ! cmp -s "$repo_file" "$local_file"; then
-                    stale_files+=("~/$path/$relative (machine: $MACHINE)")
+                ;;
+            A)
+                # Added by the remote.
+                if [[ ! -e "$local_file" ]]; then
+                    # File does not exist locally — the remote addition
+                    # has not been restored.
+                    stale_files+=("~/$home_relative (new from remote)")
+                elif [[ -f "$local_file" ]]; then
+                    if ! git -C "$REPO_DIR" show "$post_rebase_head:$repo_path" 2>/dev/null |
+                        cmp -s - "$local_file"; then
+                        # Local file exists but differs from the remote
+                        # addition — conflict.
+                        stale_files+=("~/$home_relative (conflicts with remote addition)")
+                    fi
+                    # Local == new: user already has the same content —
+                    # safe to push.
                 fi
-            fi
-        done < <(find "$repo_dir" -type f -print0)
-    done
+                ;;
+            D)
+                # Deleted by the remote.
+                if [[ -f "$local_file" ]]; then
+                    if git -C "$REPO_DIR" show "$PRE_REBASE_HEAD:$repo_path" 2>/dev/null |
+                        cmp -s - "$local_file"; then
+                        # Local == old: user never touched the file —
+                        # pushing would silently resurrect it.
+                        stale_files+=("~/$home_relative (deleted on remote)")
+                    else
+                        # Local != old: user edited the file, but the
+                        # remote deleted it — conflict.
+                        stale_files+=("~/$home_relative (edited locally, deleted on remote)")
+                    fi
+                fi
+                # Local file missing: both sides agree on deletion — safe.
+                ;;
+        esac
+    done < <(git -C "$REPO_DIR" diff --no-renames --name-status "$PRE_REBASE_HEAD" "$post_rebase_head" --)
 
     if (( ${#stale_files[@]} > 0 )); then
         echo "" >&2
-        warn "The remote contains changes that have not been restored locally."
-        warn "Pushing now would overwrite these with your local (older) copies:"
+        warn "The remote contains changes that conflict with the local state."
+        warn "Pushing now would overwrite or discard these remote changes:"
         local stale_path
         for stale_path in "${stale_files[@]}"; do
             warn "  $stale_path"
@@ -1447,7 +1575,7 @@ check_for_unrestored_remote_changes() {
         die "Aborting push — unrestored remote changes detected."
     fi
 
-    log "Staleness guard passed — local files match the repository"
+    log "Staleness guard passed — local files are up to date with remote changes"
 }
 
 push_configuration() {
