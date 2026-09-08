@@ -62,6 +62,8 @@ cask "firefox"
 cask "google-chrome"
 # Open-source video transcoder
 cask "handbrake-app"
+# Automated organisation
+cask "hazel"
 # Open Source m3u, m3u8 player
 cask "iptvnator"
 # Cable-free audio router
