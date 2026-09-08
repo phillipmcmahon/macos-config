@@ -2,7 +2,21 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.1.0
+# Version: 2.2.0
+#
+# v2.2.0:
+#   - New staleness guard: check_for_unrestored_remote_changes() runs after
+#     rebase and before collect. It compares the post-rebase repository
+#     copies of shared managed files and directories against the local
+#     copies in $HOME. If the repository (which now includes remote changes
+#     brought in by the rebase) differs from the local files, those are
+#     remote changes that have never been restored — pushing would silently
+#     overwrite them. The push is aborted with a clear list of stale files
+#     and a recommendation to run pull first.
+#   - Escape hatch: set FORCE_PUSH=1 to push anyway when the staleness
+#     guard fires (for cases where you intentionally want to overwrite).
+#   - FORCE_PUSH is validated alongside DRY_RUN in validate_configuration.
+#   - Documented FORCE_PUSH in usage() and the environment overrides block.
 #
 # v2.1.0:
 #   - New: generate_installed_apps_list() scans /Applications for .app
@@ -143,7 +157,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -167,6 +181,12 @@ BACKUP_RETENTION="${BACKUP_RETENTION:-10}"
 LOCK_DIR="${LOCK_DIR:-$HOME/.local/state/macos-config/run.lock}"
 
 DRY_RUN="${DRY_RUN:-0}"
+
+# When set to 1, the staleness guard (check_for_unrestored_remote_changes)
+# is bypassed — the push proceeds even when the remote contains changes
+# that have not been restored locally. Use with care: this can overwrite
+# configuration pushed from another machine.
+FORCE_PUSH="${FORCE_PUSH:-0}"
 
 # ----
 # Managed paths
@@ -480,6 +500,8 @@ Environment overrides:
   LOCK_DIR
   MACHINE_NAME
   DRY_RUN=1
+  FORCE_PUSH=1    Skip the staleness guard and push even when the
+                  remote has unrestored changes
 EOF
 }
 
@@ -528,6 +550,9 @@ validate_configuration() {
 
     [[ "$DRY_RUN" == "0" || "$DRY_RUN" == "1" ]] ||
         die "DRY_RUN must be either 0 or 1."
+
+    [[ "$FORCE_PUSH" == "0" || "$FORCE_PUSH" == "1" ]] ||
+        die "FORCE_PUSH must be either 0 or 1."
 
     for path in "${MANAGED_DIRECTORIES[@]}"; do
         validate_managed_path "$path"
@@ -1303,6 +1328,128 @@ scan_for_secrets() {
     log "Secret scan passed (no findings)"
 }
 
+# ----
+# Staleness guard
+# ----
+#
+# After the rebase brings in remote changes, the repository's home/ and
+# machines/$MACHINE/home/ trees may contain files that are newer than the
+# local copies in $HOME. If the user has not run pull since those changes
+# landed, collect_local_files would silently overwrite the newer remote
+# versions with the stale local copies. This function detects that
+# situation and aborts the push with a clear list of affected files.
+#
+# The check covers:
+#   - Shared managed files (MANAGED_FILES)
+#   - Shared managed directories (MANAGED_DIRECTORIES) — files inside
+#     the repository directory that differ from or do not exist locally
+#   - Machine-specific files (MACHINE_FILES)
+#   - Machine-specific directories (MACHINE_DIRECTORIES)
+#
+# The FORCE_PUSH=1 escape hatch bypasses the guard for cases where the
+# user intentionally wants to overwrite the remote versions.
+
+check_for_unrestored_remote_changes() {
+    require_repository
+
+    if [[ "${FORCE_PUSH:-0}" == "1" ]]; then
+        log "FORCE_PUSH is set — skipping staleness guard"
+        return 0
+    fi
+
+    # Nothing to compare if there is no history yet.
+    repository_has_commits || return 0
+    git -C "$REPO_DIR" show-ref --verify --quiet \
+        "refs/remotes/origin/$GIT_BRANCH" 2>/dev/null || return 0
+
+    local -a stale_files=()
+    local path repo_file local_file
+
+    # --- Shared managed files ---
+    for path in "${MANAGED_FILES[@]}"; do
+        repo_file="$(repository_path "$path")"
+        local_file="$(local_path "$path")"
+        if [[ -f "$repo_file" && -f "$local_file" ]]; then
+            if ! cmp -s "$repo_file" "$local_file"; then
+                stale_files+=("~/$path")
+            fi
+        elif [[ -f "$repo_file" && ! -e "$local_file" ]]; then
+            # Remote added a file that does not exist locally.
+            stale_files+=("~/$path (new from remote)")
+        fi
+    done
+
+    # --- Shared managed directories ---
+    for path in "${MANAGED_DIRECTORIES[@]}"; do
+        local repo_dir local_dir
+        repo_dir="$(repository_path "$path")"
+        local_dir="$(local_path "$path")"
+        [[ -d "$repo_dir" ]] || continue
+
+        while IFS= read -r -d '' repo_file; do
+            local relative="${repo_file#"$repo_dir"/}"
+            local_file="$local_dir/$relative"
+            if [[ -f "$repo_file" ]]; then
+                if [[ ! -f "$local_file" ]]; then
+                    stale_files+=("~/$path/$relative (new from remote)")
+                elif ! cmp -s "$repo_file" "$local_file"; then
+                    stale_files+=("~/$path/$relative")
+                fi
+            fi
+        done < <(find "$repo_dir" -type f -print0)
+    done
+
+    # --- Machine-specific files ---
+    ensure_machine_name
+    for path in "${MACHINE_FILES[@]}"; do
+        repo_file="$(machine_repository_path "$path")"
+        local_file="$(local_path "$path")"
+        if [[ -f "$repo_file" && -f "$local_file" ]]; then
+            if ! cmp -s "$repo_file" "$local_file"; then
+                stale_files+=("~/$path (machine: $MACHINE)")
+            fi
+        elif [[ -f "$repo_file" && ! -e "$local_file" ]]; then
+            stale_files+=("~/$path (machine: $MACHINE, new from remote)")
+        fi
+    done
+
+    # --- Machine-specific directories ---
+    for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
+        local repo_dir local_dir
+        repo_dir="$(machine_repository_path "$path")"
+        local_dir="$(local_path "$path")"
+        [[ -d "$repo_dir" ]] || continue
+
+        while IFS= read -r -d '' repo_file; do
+            local relative="${repo_file#"$repo_dir"/}"
+            local_file="$local_dir/$relative"
+            if [[ -f "$repo_file" ]]; then
+                if [[ ! -f "$local_file" ]]; then
+                    stale_files+=("~/$path/$relative (machine: $MACHINE, new from remote)")
+                elif ! cmp -s "$repo_file" "$local_file"; then
+                    stale_files+=("~/$path/$relative (machine: $MACHINE)")
+                fi
+            fi
+        done < <(find "$repo_dir" -type f -print0)
+    done
+
+    if (( ${#stale_files[@]} > 0 )); then
+        echo "" >&2
+        warn "The remote contains changes that have not been restored locally."
+        warn "Pushing now would overwrite these with your local (older) copies:"
+        local stale_path
+        for stale_path in "${stale_files[@]}"; do
+            warn "  $stale_path"
+        done
+        echo "" >&2
+        warn "Run '$SCRIPT_NAME pull' first to restore the latest versions,"
+        warn "then re-run push. To force this push anyway, set FORCE_PUSH=1."
+        die "Aborting push — unrestored remote changes detected."
+    fi
+
+    log "Staleness guard passed — local files match the repository"
+}
+
 push_configuration() {
 validate_dependencies
 validate_configuration
@@ -1310,6 +1457,7 @@ require_repository
 show_tool_versions
 
 update_from_remote_before_push
+check_for_unrestored_remote_changes
 generate_installed_apps_list
 collect_local_files
 prune_unmanaged_repository_paths
