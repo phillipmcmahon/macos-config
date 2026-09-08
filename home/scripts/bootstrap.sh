@@ -2,7 +2,29 @@
 #
 # bootstrap.sh
 #
-# Version: 1.4.0
+# Version: 1.4.2
+#
+# v1.4.2:
+#   - The brew bundle recovery command now quotes the Brewfile path so it
+#     is safe to copy-paste when the path contains spaces.
+#   - Authentication documentation updated: "auto-detects whether public
+#     or private" replaced with "checks whether anonymous access succeeds"
+#     throughout, for precision.
+#
+# v1.4.1:
+#   - Security: GITHUB_PAT is now unset unconditionally after the clone
+#     stage, regardless of whether the repository was public or private.
+#     Previously a pre-exported PAT survived into brew bundle and
+#     macos-config-sync.sh restore, partially reversing the v1.3.3 fix.
+#   - The anonymous-access failure message no longer claims the repository
+#     is definitely private; it now mentions network and GitHub outage as
+#     possible causes.
+#   - The brew bundle recovery hint now prints the actual Brewfile path
+#     instead of a hardcoded ~/Brewfile.
+#   - Added a guard that verifies the sync script exists before executing
+#     it, with a clear error message if the repository layout is unexpected.
+#   - GIT_ASKPASS helper uses printf '%s\n' instead of echo for more
+#     predictable output.
 #
 # v1.4.0:
 #   - Auto-detection of repository visibility: the script now probes the
@@ -14,8 +36,8 @@
 #   - The "Revoke the PAT" reminder in the Next Steps output is now
 #     conditional — it only appears when a PAT was actually used.
 #   - A pre-set GITHUB_PAT in the environment is respected but the script
-#     still auto-detects first; the PAT is used only if the repo turns
-#     out to be private.
+#     still checks anonymous access first; the PAT is used only if that
+#     check fails.
 #
 # v1.3.3:
 #   - GITHUB_PAT and _GIT_ASKPASS are now unset immediately after the clone
@@ -72,7 +94,7 @@
 #
 # Sets up a fresh Mac from scratch:
 #   1. Installs Homebrew (which installs Xcode Command Line Tools)
-#   2. Clones the macos-config repository via HTTPS (auto-detects auth)
+#   2. Clones the macos-config repository via HTTPS (checks anonymous access)
 #   3. Runs brew bundle to install all packages
 #   4. Runs macos-config-sync.sh restore to restore configuration files
 #
@@ -82,9 +104,9 @@
 #   bash bootstrap.sh
 #
 # Authentication:
-#   The script auto-detects whether the repository is public or private.
-#   - Public repo  → clones over HTTPS with no credentials needed.
-#   - Private repo → prompts for a GitHub Personal Access Token (PAT).
+#   The script checks whether anonymous access to the repository succeeds.
+#   - Anonymous access succeeds → clones over HTTPS with no credentials.
+#   - Anonymous access fails   → prompts for a GitHub Personal Access Token (PAT).
 #
 #   If you need a PAT, create a fine-grained token scoped to the
 #   macos-config repository with "Contents: Read-only" permission:
@@ -94,7 +116,7 @@
 #   handles all subsequent operations.
 #
 #   You can also pre-export GITHUB_PAT before running the script; it will
-#   still auto-detect and only use the PAT if the repo is private.
+#   still check anonymous access first and only use the PAT if that fails.
 #
 # After the initial clone restores your SSH keys and Git configuration,
 # the sync script uses the SSH remote for all subsequent operations.
@@ -161,8 +183,8 @@ if GIT_TERMINAL_PROMPT=0 git ls-remote "$CLONE_URL" HEAD &>/dev/null; then
     log "Repository is publicly accessible — no PAT required"
     git clone --branch "$GIT_BRANCH" "$CLONE_URL" "$REPO_DIR"
 else
-    # ── Private: fall back to PAT authentication ──
-    log "Repository requires authentication."
+    # ── Anonymous access failed: fall back to PAT authentication ──
+    log "Repository could not be accessed anonymously (private repo, network issue, or GitHub outage)."
 
     if [[ -z "${GITHUB_PAT:-}" ]]; then
         log "Create a fine-grained PAT at: https://github.com/settings/personal-access-tokens/new"
@@ -183,8 +205,8 @@ else
     cat > "$_GIT_ASKPASS" <<'HELPER'
 #!/bin/sh
 case "$1" in
-    *[Uu]sername*) echo "$GITHUB_USER" ;;
-    *)             echo "$GITHUB_PAT"  ;;
+    *[Uu]sername*) printf '%s\n' "$GITHUB_USER" ;;
+    *)             printf '%s\n' "$GITHUB_PAT"  ;;
 esac
 HELPER
     trap 'rm -f "$_GIT_ASKPASS"' EXIT
@@ -195,9 +217,13 @@ HELPER
 
     rm -f "$_GIT_ASKPASS"
     trap - EXIT
-    unset GITHUB_PAT _GIT_ASKPASS
+    unset _GIT_ASKPASS
     _USED_PAT=1
 fi
+
+# Ensure the PAT is never inherited by child processes (brew bundle,
+# macos-config-sync.sh restore), regardless of whether it was used.
+unset GITHUB_PAT
 
 # Switch to the SSH remote for all future operations.
 git -C "$REPO_DIR" remote set-url origin "git@github.com:${GITHUB_USER}/${GITHUB_REPO}.git"
@@ -264,7 +290,7 @@ if [[ -n "$BREWFILE" ]]; then
         log "Homebrew packages installed"
     else
         log "WARNING: Some Homebrew packages failed to install."
-        log "Re-run after bootstrap completes: brew bundle --file=~/Brewfile"
+        log "Re-run after bootstrap completes: brew bundle --file=\"$BREWFILE\""
     fi
 fi
 
@@ -273,6 +299,7 @@ fi
 # ----
 
 log "Restoring configuration files"
+[[ -f "$SYNC_SCRIPT" ]] || die "Sync script not found at $SYNC_SCRIPT — is the repository layout correct?"
 bash "$SYNC_SCRIPT" restore
 
 # ----
