@@ -1,4 +1,13 @@
-#!/bin/sh
+#!/usr/bin/env bash
+#
+# install-bios.sh
+#
+# Version: 1.0.1
+#
+# v1.0.1:
+#   - Changed shebang from #!/bin/sh to #!/usr/bin/env bash for
+#     consistency with the rest of the repository.
+#
 set -eu
 
 # One-line bootstrap and local wrapper. The downloaded installer is accepted
@@ -18,7 +27,7 @@ esac
 TEMP_INSTALLER=""
 TEMP_DIRECTORY=""
 DEFAULT_INSTALL_URL="https://raw.githubusercontent.com/Abdess/retrobios/main/install.py"
-DEFAULT_INSTALL_SHA256="3ea3a3e21012cc2dbf24c08a0ad314233ade04e62c0d2164b76146f1b361d714"
+DEFAULT_INSTALL_SHA256="1e06e5d364d93beff2f9b98f7bf81b4eca4b6364a6a99c87e8fcc9a472c70764"
 MAX_INSTALLER_BYTES=2097152
 
 cleanup() {
@@ -56,8 +65,7 @@ if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
   elif command -v wget >/dev/null 2>&1; then
     wget --https-only --output-document="$TEMP_INSTALLER" "$install_url"
   else
-    echo "Error: curl or wget is required to download the installer." >&2
-    echo "  On Debian or Ubuntu: sudo apt install curl" >&2
+    echo "Error: curl or wget is required." >&2
     exit 1
   fi
   actual_size=$(wc -c < "$TEMP_INSTALLER" | tr -d ' ')
@@ -75,9 +83,7 @@ if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
   fi
   expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
   if [ "$actual" != "$expected" ]; then
-    echo "Error: the downloaded installer does not match its expected fingerprint." >&2
-    echo "  Nothing was run and nothing was written." >&2
-    echo "  The download was most likely cut short. Try again, on another network if possible." >&2
+    echo "Error: install.py SHA-256 mismatch." >&2
     exit 1
   fi
   INSTALLER="$TEMP_INSTALLER"
@@ -92,8 +98,7 @@ for command_name in python3 python; do
   fi
 done
 if [ -z "$PYTHON" ]; then
-  echo "Error: Python 3.8 or newer is required." >&2
-  echo "  Install it, then run this command again. On Debian or Ubuntu: sudo apt install python3" >&2
+  echo "Error: Python 3 is required." >&2
   exit 1
 fi
 
