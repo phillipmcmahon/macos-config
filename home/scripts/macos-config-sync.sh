@@ -10,7 +10,8 @@
 #     to the SMB mount path automatically when SSH is unavailable.
 #   - Added: NAS_SSH_HOST environment variable (default: homestorage) to
 #     configure the NAS hostname for SSH transport. NAS_SSH_DIR (default:
-#     ~/macos-config) sets the remote repository path.
+#     macos-config, relative to the remote home directory) sets the remote
+#     repository path.
 #   - Added: All NAS SSH connections use a shared NAS_SSH_OPTS array
 #     (-o BatchMode=yes -o ConnectTimeout=3). BatchMode enforces key-only
 #     auth so a failed key exchange fails immediately instead of falling
@@ -26,11 +27,12 @@
 #     Synology NAS use a minimal PATH that resolves to the stock 3.1.x
 #     rsync instead of the Entware 3.4.x+ build, causing protocol
 #     mismatches and connection failures.
-#   - Fixed (Medium): Remote shell commands (--rsync-path mkdir, ssh test -d)
-#     passed NAS_SSH_DIR inside double quotes, preventing tilde expansion on
-#     the remote shell and creating a literal ~/macos-config directory. The
-#     value is now unquoted in remote commands so the remote sh expands ~ to
-#     the user's home directory.
+#   - Fixed (Medium): NAS_SSH_DIR defaulted to ~/macos-config, but
+#     --protect-args sends paths over the rsync protocol rather than through
+#     the remote shell, so tilde expansion never occurred — creating a
+#     literal ~ directory on the NAS. Changed the default to a relative path
+#     (macos-config), which rsync resolves from the remote home directory
+#     without relying on shell expansion.
 #   - Fixed (Low): SMB fallback uses --no-perms to suppress the spurious
 #     permission changes reported on every file because SMB mounts cannot
 #     preserve Unix permission bits.
@@ -314,10 +316,11 @@ NAS_REPO_DIR="${NAS_REPO_DIR:-$NAS_ROOT/macos-config}"
 # so rsync connects as the current user by default.
 NAS_SSH_HOST="${NAS_SSH_HOST:-homestorage}"
 
-# The default uses a literal tilde — it is NOT expanded locally. rsync
-# expands ~ in host:~/path destinations, and remote shell commands leave
-# the value UNQUOTED so the remote sh expands the tilde at execution time.
-NAS_SSH_DIR="${NAS_SSH_DIR:-~/macos-config}"
+# A relative path (no leading / or ~) is interpreted by rsync and the
+# remote shell as relative to the user's home directory. Avoid ~ because
+# --protect-args sends paths over the rsync protocol rather than through
+# the remote shell, so tilde expansion never occurs.
+NAS_SSH_DIR="${NAS_SSH_DIR:-macos-config}"
 
 # Path to the rsync binary on the NAS. Non-interactive SSH sessions use a
 # minimal PATH that resolves to the stock Synology rsync (/usr/bin/rsync,
@@ -673,7 +676,7 @@ Environment overrides:
   GIT_BRANCH
   REPO_DIR
   NAS_SSH_HOST    NAS hostname for SSH transport (default: homestorage)
-  NAS_SSH_DIR     Remote repository path over SSH (default: ~/macos-config)
+  NAS_SSH_DIR     Remote repository path over SSH (default: macos-config)
   NAS_RSYNC_PATH  Remote rsync binary (default: /opt/bin/rsync)
   NAS_ROOT        SMB mount point fallback (default: /Volumes/home)
   NAS_REPO_DIR    SMB repository path fallback (default: \$NAS_ROOT/macos-config)
