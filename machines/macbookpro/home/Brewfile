@@ -86,6 +86,8 @@ cask "plex"
 cask "soundsource"
 # Music streaming service
 cask "spotify"
+# Mesh VPN based on WireGuard
+cask "tailscale-app"
 # License free Wi-Fi, VPN, and Access Application for Organizations
 cask "unifi-identity-endpoint"
 # Multimedia player

@@ -32,8 +32,10 @@ Safari
 SMBMounter
 SoundSource
 Spotify
+Tailscale
 Task Manager TMOG
 UniFi Endpoint
 VLC
+WaveRace64Recomp
 ZoomVDI
 ZoomVDIUninstaller

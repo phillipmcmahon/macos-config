@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.3.9
+# Version: 1.4.0
 #
 # Exports the full Bitwarden vault (JSON) and all item attachments,
 # zips them, encrypts the archive with a GPG public key (private key
@@ -23,6 +23,17 @@
 # in a second pass (hash-matched against the verified local copy, or
 # decrypt-tested directly if no local copy remains). Both passes cover the
 # current directory and archive/.
+#
+# v1.4.0:
+#   - Interactive runs without the YubiKey no longer hard-fail. Before the
+#     decrypt test the script checks (gpg --card-status) whether a card
+#     holding the encryption key is present. If not, the export is
+#     installed and replicated under the '-unverified' name, exactly as in
+#     an unattended run, and a warning points to '--verify'. A decrypt
+#     failure WITH the key present is still a hard failure (the file is
+#     kept as DECRYPT-FAILED-* for inspection).
+#   - '--verify' resolves the encryption key and checks for the YubiKey up
+#     front, aborting with a clear message instead of failing per file.
 #
 # v1.3.9:
 #   - Guard against TMPDIR=/ edge case: trailing-slash strip is skipped
@@ -348,6 +359,19 @@ resolve_gpg_enc_fpr() {
   echo "Using GPG encryption key fingerprint $gpg_enc_fpr"
 }
 
+# True if an OpenPGP card (YubiKey) that carries the encryption key is
+# currently inserted. --card-status --with-colons emits
+#   fpr:<sig fpr>:<enc fpr>:<auth fpr>:
+# and exits non-zero when no card is available. The check never prompts for
+# a PIN, so it is safe to run before deciding whether to decrypt-test.
+card_has_enc_key() {
+  local card
+  card=$(gpg --batch --with-colons --card-status 2>/dev/null) || return 1
+  printf '%s\n' "$card" | awk -F: -v want="$gpg_enc_fpr" '
+    $1 == "fpr" { for (i = 2; i <= NF; i++) if ($i == want) found = 1 }
+    END { exit found ? 0 : 1 }'
+}
+
 # ----
 # --verify mode: decrypt-test pending '-unverified' exports and rename
 # the local copy and its NAS copy after all checks pass.
@@ -383,6 +407,10 @@ verify_pending() {
 
   if [[ ! -t 0 ]]; then
     echo "Error: --verify needs an interactive session (YubiKey PIN entry)." >&2
+    return 1
+  fi
+  if ! card_has_enc_key; then
+    echo "Error: no YubiKey holding encryption key $gpg_enc_fpr is present; insert it and re-run --verify." >&2
     return 1
   fi
   if nas_available; then
@@ -491,6 +519,7 @@ case "${1:-}" in
     # no encryption-key resolution.
     require_cmds gpg
     require_sha256
+    resolve_gpg_enc_fpr
     acquire_lock
     verify_pending
     exit $?
@@ -636,14 +665,25 @@ secure_rm_file "$random_dir/$zip_file"
 # previous local export is rotated out or anything is copied to the NAS.
 # The decryption test requires the YubiKey + interactive PIN entry.
 #
-# Policy for non-interactive runs (cron/launchd): the export IS installed
-# and replicated — an unverified backup is better than none — but under a
+# Policy when the test cannot run — non-interactive session (cron/launchd)
+# or no YubiKey holding the key inserted: the export IS installed and
+# replicated — an unverified backup is better than none — but under a
 # distinct '-unverified' name so it can never be confused with a
-# recovery-tested backup. Verify it manually and rename it when convenient.
+# recovery-tested backup. Run '--verify' later to test and rename it.
+#
+# When the test CAN run (interactive + key present) a failure is a hard
+# error: the key is there, so an undecryptable file means something is
+# genuinely wrong (wrong card, PIN failures, corrupt output).
 final_name="$zip_file.gpg"
+skip_reason=""
 if [[ ! -t 0 ]]; then
+  skip_reason="non-interactive session"
+elif ! card_has_enc_key; then
+  skip_reason="no YubiKey holding encryption key $gpg_enc_fpr is present"
+fi
+if [ -n "$skip_reason" ]; then
   final_name="${zip_file%.zip}-unverified.zip.gpg"
-  echo "Warning: non-interactive session — decrypt verification skipped." >&2
+  echo "Warning: $skip_reason — decrypt verification skipped." >&2
   echo "Export will be installed as $final_name (NOT recovery-tested)." >&2
   echo "Run '$0 --verify' with the YubiKey present to decrypt-test it and" >&2
   echo "rename the local and NAS copies to '$zip_file.gpg'." >&2
@@ -655,7 +695,7 @@ else
     # rotated or replicated as a backup, but retain it for inspection.
     failed_copy="$downloads_dir/DECRYPT-FAILED-$zip_file.gpg"
     mv "$random_dir/$zip_file.gpg" "$failed_copy"
-    echo "Error: could not decrypt the export — check your YubiKey." >&2
+    echo "Error: YubiKey present but the export could not be decrypted (wrong card, PIN, or corrupt output)." >&2
     echo "Encrypted file kept at $failed_copy for inspection; previous export left in place, NAS copy skipped." >&2
     exit 1
   fi
@@ -717,3 +757,4 @@ else
 fi
 
 echo "Bitwarden export completed."
+
