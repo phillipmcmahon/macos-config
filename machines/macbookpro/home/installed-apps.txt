@@ -2,6 +2,7 @@ Adguard
 AdGuard VPN
 Arq
 Audio Hijack
+Better Dock
 Bitwarden
 Citrix Workspace
 Emby
