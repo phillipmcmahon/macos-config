@@ -2,7 +2,15 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.5.0
+# Version: 2.6.0
+#
+# v2.6.0:
+#   - New: generate_brewfile() regenerates ~/Brewfile from the currently
+#     installed Homebrew packages on every push, using 'brew bundle dump
+#     --describe --force'. The Brewfile is now always an accurate snapshot
+#     of the machine's installed taps, formulae, casks and Mac App Store
+#     apps — matching the existing installed-apps.txt behaviour. Skipped
+#     with a warning if Homebrew is not installed.
 #
 # v2.5.0:
 #   - New: ~/.ssh/config is now a shared managed file, synced across all
@@ -228,7 +236,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.6.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -1114,6 +1122,27 @@ log "Repository initialised: $REPO_DIR"
 # and tracked as a machine-specific managed file, giving each Mac its
 # own inventory in the repository.
 
+generate_brewfile() {
+    local output_file
+    output_file="$(local_path "Brewfile")"
+
+    if ! command -v brew >/dev/null 2>&1; then
+        warn "Homebrew is not installed — skipping Brewfile generation"
+        return 0
+    fi
+
+    log "Generating Brewfile: $output_file"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY-RUN: Would write Brewfile to $output_file"
+        return 0
+    fi
+
+    brew bundle dump --describe --force --file="$output_file"
+
+    log "Brewfile generated ($(wc -l < "$output_file" | tr -d ' ') lines)"
+}
+
 generate_installed_apps_list() {
     local output_file
     output_file="$(local_path "installed-apps.txt")"
@@ -1596,6 +1625,7 @@ show_tool_versions
 
 update_from_remote_before_push
 check_for_unrestored_remote_changes
+generate_brewfile
 generate_installed_apps_list
 collect_local_files
 prune_unmanaged_repository_paths
