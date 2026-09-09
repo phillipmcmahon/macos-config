@@ -15,7 +15,8 @@
 #     (-o BatchMode=yes -o ConnectTimeout=3). BatchMode enforces key-only
 #     auth so a failed key exchange fails immediately instead of falling
 #     through to password prompting. rsync receives the same options via
-#     -e "ssh ${NAS_SSH_OPTS[*]}".
+#     -e "$NAS_SSH_CMD". A separate NAS_SSH_CMD string is used for rsync's
+#     -e flag because it performs its own word splitting.
 #   - Improved: The remote directory is created via --rsync-path rather than
 #     a separate ssh mkdir call, reducing the number of SSH connections per
 #     push from three to two (probe + rsync) to avoid tripping brute-force
@@ -847,6 +848,10 @@ ensure_repository_structure() {
 # prompts — if key authentication fails, the connection fails immediately
 # instead of hanging or triggering brute-force protections on the NAS.
 NAS_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=3)
+
+# The same options as a single string for rsync's -e flag, which performs
+# its own word splitting (array expansion inside -e is not reliable).
+NAS_SSH_CMD="ssh -o BatchMode=yes -o ConnectTimeout=3"
 
 nas_ssh_available() {
     ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" true 2>/dev/null
@@ -2001,7 +2006,7 @@ if nas_ssh_available; then
     # the same SSH connection as the transfer, avoiding a separate
     # connection that could trip brute-force protections on the NAS.
     run rsync \
-        -e "ssh ${NAS_SSH_OPTS[*]}" \
+        -e "$NAS_SSH_CMD" \
         --rsync-path="mkdir -p \"$NAS_SSH_DIR\" && rsync" \
         "${COMMON_RSYNC_OPTIONS[@]}" \
         "${nas_mirror_options[@]}" \
@@ -2051,7 +2056,7 @@ if nas_ssh_available; then
     step "Restoring local repository files from NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
 
     run rsync \
-        -e "ssh ${NAS_SSH_OPTS[*]}" \
+        -e "$NAS_SSH_CMD" \
         "${COMMON_RSYNC_OPTIONS[@]}" \
         "$NAS_SSH_HOST:$NAS_SSH_DIR/" \
         "$REPO_DIR/"
