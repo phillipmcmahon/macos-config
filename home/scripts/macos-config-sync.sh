@@ -2,7 +2,14 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.6.2
+# Version: 2.7.0
+#
+# v2.7.0:
+#   - Improved: Colourised terminal output following the style used in
+#     configure-yubikey.sh. Success messages print in green, warnings in
+#     yellow, errors in red, and section headers in blue. Colours are
+#     disabled automatically when stdout is not a terminal (piped or
+#     redirected). No operational logic was changed.
 #
 # v2.6.2:
 #   - Fixed (Medium): The ~/.ssh/sockets/ directory documented in v2.5.0
@@ -253,7 +260,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.6.2"
+readonly SCRIPT_VERSION="2.7.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -428,25 +435,44 @@ detect_machine_name() {
 }
 
 # ----
+# Colours (disabled if stdout is not a terminal)
+# ----
+
+if [[ -t 1 ]]; then
+    C_GREEN=$'\033[0;32m'; C_RED=$'\033[0;31m'; C_YELLOW=$'\033[0;33m'
+    C_BLUE=$'\033[0;34m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+else
+    C_GREEN=""; C_RED=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
+fi
+
+# ----
 # Logging and errors
 # ----
 
 log() {
-    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    printf '%s[%s]%s %s\n' "$C_GREEN" "$(date '+%Y-%m-%d %H:%M:%S')" "$C_RESET" "$*"
+}
+
+ok() {
+    printf '%s[%s] ✔ %s%s\n' "$C_GREEN" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$C_RESET"
+}
+
+step() {
+    printf '%s[%s] ▸ %s%s\n' "$C_BLUE" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$C_RESET"
 }
 
 warn() {
-    printf '[%s] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+    printf '%s[%s] WARNING: %s%s\n' "$C_YELLOW" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$C_RESET" >&2
 }
 
 die() {
-    printf '[%s] ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+    printf '%s[%s] ERROR: %s%s\n' "$C_RED" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$C_RESET" >&2
     exit 1
 }
 
 run() {
     if [[ "$DRY_RUN" == "1" ]]; then
-        printf 'DRY-RUN:'
+        printf '%sDRY-RUN:%s' "$C_YELLOW" "$C_RESET"
         printf ' %q' "$@"
         printf '\n'
     else
@@ -458,10 +484,12 @@ on_error() {
     local exit_code=$?
     local line_number="${1:-unknown}"
 
-    printf '[%s] ERROR: Command failed at line %s with exit code %s\n' \
+    printf '%s[%s] ERROR: Command failed at line %s with exit code %s%s\n' \
+        "$C_RED" \
         "$(date '+%Y-%m-%d %H:%M:%S')" \
         "$line_number" \
-        "$exit_code" >&2
+        "$exit_code" \
+        "$C_RESET" >&2
 
     exit "$exit_code"
 }
@@ -691,7 +719,7 @@ show_tool_versions() {
     rsync_version_output="$(rsync --version)"
     rsync_version_first_line="${rsync_version_output%%$'\n'*}"
 
-    log "Script version: $SCRIPT_VERSION"
+    step "Script version: ${C_BOLD}${SCRIPT_VERSION}${C_RESET}${C_BLUE}"
     log "Machine name: ${MACHINE:-<not yet resolved>}"
     log "Using rsync: $(command -v rsync)"
     log "$rsync_version_first_line"
@@ -899,7 +927,7 @@ prune_unmanaged_repository_paths() {
 
     [[ -d "$repository_home" ]] || return 0
 
-    log "Removing repository paths that are no longer managed"
+    step "Removing repository paths that are no longer managed"
 
     while IFS= read -r -d '' item; do
         relative_path="${item#"$repository_home"/}"
@@ -952,7 +980,7 @@ prune_unmanaged_machine_paths() {
 
     [[ -d "$machine_home" ]] || return 0
 
-    log "Removing machine paths that are no longer managed (machine: $MACHINE)"
+    step "Removing machine paths that are no longer managed (machine: $MACHINE)"
 
     while IFS= read -r -d '' item; do
         relative_path="${item#"$machine_home"/}"
@@ -1104,14 +1132,14 @@ if repository_exists; then
     return 0
 fi
 
-log "Checking access to GitHub repository"
+step "Checking access to GitHub repository"
 
 git ls-remote "$GITHUB_REPO" >/dev/null 2>&1 ||
     die "Unable to access GitHub repository: $GITHUB_REPO"
 
 run mkdir -p "$(dirname "$REPO_DIR")"
 
-log "Cloning GitHub repository"
+step "Cloning GitHub repository"
 run git clone "$GITHUB_REPO" "$REPO_DIR"
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -1134,7 +1162,7 @@ fi
 ensure_repository_structure
 create_repository_files
 
-log "Repository initialised: $REPO_DIR"
+ok "Repository initialised: $REPO_DIR"
 }
 
 # ----
@@ -1157,7 +1185,7 @@ generate_brewfile() {
         return 0
     fi
 
-    log "Generating Brewfile: $output_file"
+    step "Generating Brewfile: $output_file"
 
     if [[ "$DRY_RUN" == "1" ]]; then
         log "DRY-RUN: Would write Brewfile to $output_file"
@@ -1166,14 +1194,14 @@ generate_brewfile() {
 
     brew bundle dump --force --file="$output_file"
 
-    log "Brewfile generated ($(wc -l < "$output_file" | tr -d ' ') lines)"
+    ok "Brewfile generated ($(wc -l < "$output_file" | tr -d ' ') lines)"
 }
 
 generate_installed_apps_list() {
     local output_file
     output_file="$(local_path "installed-apps.txt")"
 
-    log "Generating installed applications list: $output_file"
+    step "Generating installed applications list: $output_file"
 
     if [[ "$DRY_RUN" == "1" ]]; then
         log "DRY-RUN: Would write installed apps list to $output_file"
@@ -1191,7 +1219,7 @@ generate_installed_apps_list() {
         done < <(find /Applications -maxdepth 1 -name '*.app' -print0)
     ) | LC_ALL=C sort -f >"$output_file"
 
-    log "Listed $(wc -l < "$output_file" | tr -d ' ') applications"
+    ok "Listed $(wc -l < "$output_file" | tr -d ' ') applications"
 }
 
 # ----
@@ -1266,12 +1294,12 @@ fi
 # The stash is popped after rebase, letting commit_and_push pick them up.
 local stashed=0
 if ! repository_is_clean; then
-    log "Stashing uncommitted changes before remote update"
+    step "Stashing uncommitted changes before remote update"
     run git -C "$REPO_DIR" stash push -m "macos-config-sync: auto-stash before rebase"
     stashed=1
 fi
 
-log "Fetching current remote branch"
+step "Fetching current remote branch"
 
 run git -C "$REPO_DIR" fetch origin "$GIT_BRANCH"
 
@@ -1292,7 +1320,7 @@ else
 fi
 
 if (( stashed )); then
-    log "Restoring stashed changes"
+    step "Restoring stashed changes"
     git -C "$REPO_DIR" stash pop || die "Stash pop failed — resolve conflicts in $REPO_DIR"
 fi
 }
@@ -1334,7 +1362,7 @@ if git -C "$REPO_DIR" diff --cached --quiet; then
     if has_unpushed_commits; then
         log "Local commits have not been pushed yet — pushing now"
         git -C "$REPO_DIR" push -u origin "$GIT_BRANCH"
-        log "Changes pushed to GitHub"
+        ok "Changes pushed to GitHub"
     fi
 
     return 0
@@ -1407,7 +1435,7 @@ scan_for_secrets() {
     # never been tracked before.
     run git -C "$REPO_DIR" add --all
 
-    log "Scanning staged files for secret material"
+    step "Scanning staged files for secret material"
 
     local -i findings=0
     local pattern relative_path
@@ -1427,7 +1455,7 @@ scan_for_secrets() {
     done < <(git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR -z)
 
     if (( ${#staged_files[@]} == 0 )); then
-        log "Secret scan passed (no staged files to scan)"
+        ok "Secret scan passed (no staged files to scan)"
         return 0
     fi
 
@@ -1483,7 +1511,7 @@ scan_for_secrets() {
         die "Aborting push — resolve secret scan findings first."
     fi
 
-    log "Secret scan passed (no findings)"
+    ok "Secret scan passed (no findings)"
 }
 
 # ----
@@ -1535,7 +1563,7 @@ check_for_unrestored_remote_changes() {
 
     # If HEAD did not move, the rebase introduced no remote changes.
     if [[ "$PRE_REBASE_HEAD" == "$post_rebase_head" ]]; then
-        log "Staleness guard passed — no remote changes in rebase"
+        ok "Staleness guard passed — no remote changes in rebase"
         return 0
     fi
 
@@ -1640,7 +1668,7 @@ check_for_unrestored_remote_changes() {
         die "Aborting push — unrestored remote changes detected."
     fi
 
-    log "Staleness guard passed — local files are up to date with remote changes"
+    ok "Staleness guard passed — local files are up to date with remote changes"
 }
 
 push_configuration() {
@@ -1671,7 +1699,7 @@ local path
 
 backup_dir="$BACKUP_ROOT/$(date '+%Y%m%d_%H%M%S')"
 
-log "Creating local backup: $backup_dir"
+step "Creating local backup: $backup_dir"
 
 run mkdir -p "$backup_dir"
 
@@ -1715,7 +1743,7 @@ for path in "${MACHINE_FILES[@]}"; do
         "$(backup_path "$backup_dir" "$path")"
 done
 
-log "Local backup completed"
+ok "Local backup completed"
 }
 
 prune_local_backups() {
@@ -1743,7 +1771,7 @@ fi
 
 remove_count=$((backup_count - BACKUP_RETENTION))
 
-log "Removing $remove_count old local backup(s)"
+step "Removing $remove_count old local backup(s)"
 
 while IFS= read -r old_backup; do
     [[ -n "$old_backup" ]] || continue
@@ -1858,8 +1886,8 @@ fi
 
 prune_local_backups
 
-log "Configuration restored"
-log "Open a new terminal session or run: exec zsh"
+ok "Configuration restored"
+log "Open a new terminal session or run: ${C_BOLD}exec zsh${C_RESET}"
 }
 
 pull_configuration() {
@@ -1874,7 +1902,7 @@ repository_is_clean ||
 remote_branch_exists ||
     die "Remote branch does not exist: $GIT_BRANCH"
 
-log "Fetching the latest configuration from GitHub"
+step "Fetching the latest configuration from GitHub"
 
 run git -C "$REPO_DIR" fetch origin "$GIT_BRANCH"
 run git -C "$REPO_DIR" checkout "$GIT_BRANCH"
@@ -1900,7 +1928,7 @@ validate_configuration
 require_repository
 show_tool_versions
 
-log "Restoring configuration from local repository (no remote contact)"
+step "Restoring configuration from local repository (no remote contact)"
 restore_local_files
 }
 
@@ -1916,7 +1944,7 @@ if ! nas_available; then
     return 0
 fi
 
-log "Mirroring repository files to NAS: $NAS_REPO_DIR"
+step "Mirroring repository files to NAS: $NAS_REPO_DIR"
 
 run mkdir -p "$NAS_REPO_DIR"
 
@@ -1936,7 +1964,7 @@ run rsync \
     "$REPO_DIR/" \
     "$NAS_REPO_DIR/"
 
-log "NAS mirror updated"
+ok "NAS mirror updated"
 }
 
 restore_repository_from_nas() {
@@ -1952,7 +1980,7 @@ if [[ -e "$REPO_DIR" ]]; then
     die "Local repository already exists: $REPO_DIR"
 fi
 
-log "Restoring local repository files from NAS"
+step "Restoring local repository files from NAS"
 
 run mkdir -p "$(dirname "$REPO_DIR")"
 
@@ -1961,7 +1989,7 @@ run rsync \
     "$NAS_REPO_DIR/" \
     "$REPO_DIR/"
 
-log "Re-attaching Git history from GitHub"
+step "Re-attaching Git history from GitHub"
 
 if git ls-remote "$GITHUB_REPO" >/dev/null 2>&1; then
     run git -C "$REPO_DIR" init
@@ -1977,7 +2005,7 @@ if git ls-remote "$GITHUB_REPO" >/dev/null 2>&1; then
         git -C "$REPO_DIR" branch --set-upstream-to "origin/$GIT_BRANCH"
     fi
 
-    log "Repository restored from NAS and reconnected to GitHub"
+    ok "Repository restored from NAS and reconnected to GitHub"
     log "Run '$SCRIPT_NAME pull' to deploy the restored files."
 else
     warn "Unable to access GitHub repository: $GITHUB_REPO"
@@ -1995,25 +2023,25 @@ validate_configuration
 show_tool_versions
 
 printf '\n'
-printf 'GitHub repository: %s\n' "$GITHUB_REPO"
-printf 'Git branch:        %s\n' "$GIT_BRANCH"
-printf 'Local repository:  %s\n' "$REPO_DIR"
-printf 'NAS root:          %s\n' "$NAS_ROOT"
-printf 'NAS repository:    %s\n' "$NAS_REPO_DIR"
-printf 'Backup directory:  %s\n' "$BACKUP_ROOT"
-printf 'Backup retention:  %s\n' "$BACKUP_RETENTION"
-printf 'Machine name:      %s\n' "$MACHINE"
-printf '\nShared managed paths:\n'
+printf '%sGitHub repository:%s %s\n' "$C_BLUE" "$C_RESET" "$GITHUB_REPO"
+printf '%sGit branch:%s        %s\n' "$C_BLUE" "$C_RESET" "$GIT_BRANCH"
+printf '%sLocal repository:%s  %s\n' "$C_BLUE" "$C_RESET" "$REPO_DIR"
+printf '%sNAS root:%s          %s\n' "$C_BLUE" "$C_RESET" "$NAS_ROOT"
+printf '%sNAS repository:%s    %s\n' "$C_BLUE" "$C_RESET" "$NAS_REPO_DIR"
+printf '%sBackup directory:%s  %s\n' "$C_BLUE" "$C_RESET" "$BACKUP_ROOT"
+printf '%sBackup retention:%s  %s\n' "$C_BLUE" "$C_RESET" "$BACKUP_RETENTION"
+printf '%sMachine name:%s      %s\n' "$C_BLUE" "$C_RESET" "$MACHINE"
+printf '\n%sShared managed paths:%s\n' "$C_BOLD" "$C_RESET"
 print_managed_paths
-printf '\nMachine-specific paths (machines/%s/home):\n' "$MACHINE"
+printf '\n%sMachine-specific paths (machines/%s/home):%s\n' "$C_BOLD" "$MACHINE" "$C_RESET"
 print_machine_paths
 
 if [[ -d "$REPO_DIR/machines" ]]; then
-    printf '\nMachines recorded in the repository:\n'
+    printf '\n%sMachines recorded in the repository:%s\n' "$C_BOLD" "$C_RESET"
     local machine_dir
     while IFS= read -r machine_dir; do
         if [[ "${machine_dir##*/}" == "$MACHINE" ]]; then
-            printf '  %s (this machine)\n' "${machine_dir##*/}"
+            printf '  %s%s (this machine)%s\n' "$C_GREEN" "${machine_dir##*/}" "$C_RESET"
         else
             printf '  %s\n' "${machine_dir##*/}"
         fi
@@ -2022,46 +2050,46 @@ fi
 printf '\n'
 
 if repository_exists; then
-    printf 'Local Git status:\n'
+    printf '\n%sLocal Git status:%s\n' "$C_BOLD" "$C_RESET"
     git -C "$REPO_DIR" status --short --branch
     printf '\n'
 
-    printf 'Configured remotes:\n'
+    printf '%sConfigured remotes:%s\n' "$C_BOLD" "$C_RESET"
     git -C "$REPO_DIR" remote -v
     printf '\n'
 
     if repository_has_commits; then
-        printf 'Latest local commit:\n'
+        printf '%sLatest local commit:%s\n' "$C_BOLD" "$C_RESET"
         git -C "$REPO_DIR" log \
             -1 \
             --date=iso \
             --format='  %h %ad %an%n  %s'
         printf '\n\n'
     else
-        printf 'The local repository does not yet contain a commit.\n\n'
+        printf '%sThe local repository does not yet contain a commit.%s\n\n' "$C_YELLOW" "$C_RESET"
     fi
 
     if remote_branch_exists; then
-        printf 'Remote branch is available: origin/%s\n' "$GIT_BRANCH"
+        printf '%s✔ Remote branch is available:%s origin/%s\n' "$C_GREEN" "$C_RESET" "$GIT_BRANCH"
     else
-        printf 'Remote branch is not available: origin/%s\n' "$GIT_BRANCH"
+        printf '%s✘ Remote branch is not available:%s origin/%s\n' "$C_RED" "$C_RESET" "$GIT_BRANCH"
     fi
 else
-    printf 'Local repository is not initialised.\n'
+    printf '%s✘ Local repository is not initialised.%s\n' "$C_RED" "$C_RESET"
 fi
 
 printf '\n'
 
 if nas_available; then
-    printf 'NAS root is mounted: %s\n' "$NAS_ROOT"
+    printf '%s✔ NAS root is mounted:%s %s\n' "$C_GREEN" "$C_RESET" "$NAS_ROOT"
 
     if [[ -d "$NAS_REPO_DIR/home" ]]; then
-        printf 'NAS repository mirror is present.\n'
+        printf '%s✔ NAS repository mirror is present.%s\n' "$C_GREEN" "$C_RESET"
     else
-        printf 'NAS repository mirror is not present.\n'
+        printf '%s✘ NAS repository mirror is not present.%s\n' "$C_YELLOW" "$C_RESET"
     fi
 else
-    printf 'NAS root is not mounted: %s\n' "$NAS_ROOT"
+    printf '%s✘ NAS root is not mounted:%s %s\n' "$C_RED" "$C_RESET" "$NAS_ROOT"
 fi
 }
 
@@ -2123,4 +2151,3 @@ esac
 }
 
 main "$@"
-
