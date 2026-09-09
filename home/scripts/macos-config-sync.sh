@@ -756,29 +756,28 @@ The machine name defaults to 'scutil --get LocalHostName' (fallback:
 hostname -s), sanitised to [A-Za-z0-9._-]. Override with MACHINE_NAME.
 
 Environment overrides:
-  GITHUB_REPO     GitHub repository URL
-                  (default: git@github.com:phillipmcmahon/macos-config.git)
-  GIT_BRANCH      Branch to push/pull (default: main)
-  REPO_DIR        Local repository path
-                  (default: \$HOME/.local/share/macos-config)
-  NAS_SSH_HOST    NAS hostname for SSH transport (default: homestorage)
-  NAS_SSH_DIR     Remote repository path over SSH, relative to the remote
-                  user's home directory (default: macos-config)
-  NAS_RSYNC_PATH  Remote rsync binary (default: /opt/bin/rsync)
-  NAS_ROOT        SMB mount point fallback (default: /Volumes/home)
-  NAS_REPO_DIR    SMB repository path fallback
-                  (default: \$NAS_ROOT/macos-config)
-  BACKUP_ROOT     Pre-restore backup directory
-                  (default: \$HOME/.local/state/macos-config/backups)
-  BACKUP_RETENTION
-                  Number of backup snapshots to keep (default: 10)
-  LOCK_DIR        Lock directory for concurrent-run prevention
-                  (default: \$HOME/.local/state/macos-config/run.lock)
-  MACHINE_NAME    Override the auto-detected machine name (default:
-                  scutil --get LocalHostName, fallback: hostname -s)
-  DRY_RUN=1       Log commands without executing them
-  FORCE_PUSH=1    Skip the staleness guard and push even when the
-                  remote has unrestored changes
+  GITHUB_REPO       GitHub repository URL (default: git@github.com:
+                    phillipmcmahon/macos-config.git)
+  GIT_BRANCH        Branch to push/pull (default: main)
+  REPO_DIR          Local repository path
+                    (default: \$HOME/.local/share/macos-config)
+  NAS_SSH_HOST      NAS hostname for SSH transport (default: homestorage)
+  NAS_SSH_DIR       Remote repository path over SSH, relative to the
+                    remote user's home directory (default: macos-config)
+  NAS_RSYNC_PATH    Remote rsync binary (default: /opt/bin/rsync)
+  NAS_ROOT          SMB mount point fallback (default: /Volumes/home)
+  NAS_REPO_DIR      SMB repository path fallback
+                    (default: \$NAS_ROOT/macos-config)
+  BACKUP_ROOT       Pre-restore backup directory
+                    (default: \$HOME/.local/state/macos-config/backups)
+  BACKUP_RETENTION  Number of backup snapshots to keep (default: 10)
+  LOCK_DIR          Lock directory for concurrent-run prevention
+                    (default: \$HOME/.local/state/macos-config/run.lock)
+  MACHINE_NAME      Override the auto-detected machine name (default:
+                    scutil --get LocalHostName, fallback: hostname -s)
+  DRY_RUN=1         Log commands without executing them
+  FORCE_PUSH=1      Skip the staleness guard and push even when the
+                    remote has unrestored changes
 EOF
 }
 
