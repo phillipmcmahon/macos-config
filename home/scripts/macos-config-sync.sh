@@ -2,7 +2,73 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.7.2
+# Version: 2.7.8
+#
+# v2.7.8:
+#   - Fixed (Medium): init bypasses require_repository() and calls
+#     repository_exists() directly, so an existing symlinked $REPO_DIR was
+#     still accepted. Moved the symlink invariant into repository_exists()
+#     itself (! -L && -d) so every caller inherits it. Added an explicit
+#     symlink guard with a diagnostic message at the top of
+#     initialise_repository() before the repository_exists check. The
+#     existing require_repository() diagnostic is retained for non-init
+#     code paths.
+#
+# v2.7.7:
+#   - Fixed (Medium): $REPO_DIR itself could be a symbolic link, bypassing all
+#     component-level symlink validation that assumes a real directory root.
+#     require_repository() now explicitly rejects a symlinked repository root
+#     before any other checks.
+#
+# v2.7.6:
+#   - Fixed (High): Push (collect_local_files) validated the local $HOME source
+#     tree but not the repository destination tree. A symlink inside $REPO_DIR
+#     (from a prior compromised push, manual edit, or NAS restore) could
+#     redirect ensure_repository_structure's mkdir -p or rsync writes outside
+#     the repository. Added pre-flight reject_symlink_components checks for
+#     every repository destination path — both shared (home/) and machine-
+#     specific (machines/$MACHINE/home/) — before any directories are created
+#     or files are written. Existing repository directories also receive an
+#     interior symlink scan.
+#
+# v2.7.5:
+#   - Fixed (High): Only the final managed pathname was checked for being a
+#     symlink. A parent component (e.g. ~/.config being a symlink when a
+#     managed file lives at ~/.config/foo/bar) could redirect the entire
+#     subtree without detection. Replaced all individual symlink checks
+#     (reject_managed_symlink and the -L preamble in
+#     reject_symlinks_in_directory) with a single reject_symlink_components()
+#     helper that walks every component between a trusted root ($HOME or
+#     $REPO_DIR) and the managed leaf. The interior directory scan (find
+#     -type l) is retained for directories.
+#   - This is an architectural hardening change. The previous incremental
+#     patches (v2.7.2 file-level rejection, v2.7.3 directory interior scan,
+#     v2.7.4 directory-as-symlink and restore-side checks, v2.7.5-pre
+#     local-destination checks) are all subsumed by the component-walking
+#     approach.
+#
+# v2.7.4:
+#   - Fixed (Medium): A managed directory that is itself a symbolic link to
+#     a real directory passed the [[ -d ]] test in reject_symlinks_in_directory
+#     because -d follows symlinks. The function now checks [[ -L ]] first and
+#     rejects the path before evaluating -d.
+#   - Fixed (Low): restore_local_files() did not validate repository-side
+#     sources for symlinks before copying them into $HOME. A symlink in the
+#     repository (from a pre-v2.7.3 push, manual edit, or NAS restore) would
+#     be blindly deployed. Added reject_managed_symlink calls for file sources
+#     and reject_symlinks_in_directory calls for directory sources on the
+#     restore path, matching the push-side checks.
+#
+# v2.7.3:
+#   - Fixed (Medium): NAS_RSYNC_PATH is interpolated into remote shell
+#     commands (--rsync-path) without validation. Added validation in
+#     validate_configuration() that requires a non-empty absolute path and
+#     restricts it to the same safe character set as NAS_SSH_DIR.
+#   - Fixed (Low): Symbolic links nested inside managed directories were
+#     silently copied into the repository by rsync. Added a pre-flight
+#     scan (reject_symlinks_in_directory) that aborts the push if any
+#     symlinks are found inside managed or machine-specific directories,
+#     consistent with the existing file-level symlink rejection.
 #
 # v2.7.2:
 #   - Fixed (Medium): NAS_SSH_DIR is interpolated into remote shell commands
@@ -311,7 +377,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.7.2"
+readonly SCRIPT_VERSION="2.7.8"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -782,6 +848,18 @@ validate_configuration() {
         die "NAS_SSH_DIR contains unsafe characters (only alphanumerics, hyphens, underscores, dots, and / are allowed): $NAS_SSH_DIR"
     fi
 
+    # NAS_RSYNC_PATH is interpolated into --rsync-path, which is executed by
+    # the remote shell. Require a non-empty absolute path with safe characters.
+    if [[ -z "$NAS_RSYNC_PATH" ]]; then
+        die "NAS_RSYNC_PATH must not be empty."
+    fi
+    if [[ "$NAS_RSYNC_PATH" != /* ]]; then
+        die "NAS_RSYNC_PATH must be an absolute path: $NAS_RSYNC_PATH"
+    fi
+    if [[ "$NAS_RSYNC_PATH" =~ [^a-zA-Z0-9_./-] ]]; then
+        die "NAS_RSYNC_PATH contains unsafe characters (only alphanumerics, hyphens, underscores, dots, and / are allowed): $NAS_RSYNC_PATH"
+    fi
+
     for path in "${MANAGED_DIRECTORIES[@]}"; do
         validate_managed_path "$path"
     done
@@ -859,10 +937,14 @@ release_lock() {
 # ----
 
 repository_exists() {
-    [[ -d "$REPO_DIR/.git" ]]
+    [[ ! -L "$REPO_DIR" && -d "$REPO_DIR/.git" ]]
 }
 
 require_repository() {
+    if [[ -L "$REPO_DIR" ]]; then
+        die "Repository directory must not be a symbolic link: $REPO_DIR"
+    fi
+
     repository_exists ||
         die "Repository is not initialised. Run: $SCRIPT_NAME init"
 }
@@ -972,16 +1054,44 @@ sync_file() {
         "$destination_file"
 }
 
-# Reject symbolic links among managed files. The sync and staleness-guard
-# logic compares file content directly; a symlink would silently proxy its
-# target's content, making comparisons unreliable and potentially leaking
-# files outside the managed set into the repository.
-reject_managed_symlink() {
-    local file_path="$1"
-    local label="${2:-$file_path}"
+# Validate every path component between a trusted root and a managed leaf.
+# A symlink at any intermediate component (e.g. ~/.config being a symlink
+# when a managed file lives at ~/.config/foo/bar) redirects the entire
+# subtree — checking only the final pathname misses this.
+reject_symlink_components() {
+    local root="$1"
+    local relative_path="$2"
+    local label="${3:-$relative_path}"
+    local current="$root"
+    local component
 
-    if [[ -L "$file_path" ]]; then
-        die "Managed file is a symbolic link (not supported): $label"
+    while IFS= read -r component; do
+        [[ -n "$component" ]] || continue
+
+        current="$current/$component"
+
+        if [[ -L "$current" ]]; then
+            die "Managed path traverses a symbolic link (not supported): $current ($label)"
+        fi
+    done < <(printf '%s\n' "$relative_path" | tr '/' '\n')
+}
+
+# Scan inside a managed directory for symbolic links. rsync --archive
+# preserves symlinks as-is, so they would be copied into the repository
+# and mishandled by the staleness guard. The caller must have already
+# validated the path components to this directory with
+# reject_symlink_components; this function only checks the interior.
+reject_symlinks_in_directory() {
+    local dir_path="$1"
+    local label="${2:-$dir_path}"
+
+    [[ -d "$dir_path" ]] || return 0
+
+    local first_symlink
+    first_symlink="$(find "$dir_path" -type l -print -quit 2>/dev/null)" || true
+
+    if [[ -n "$first_symlink" ]]; then
+        die "Managed directory contains a symbolic link (not supported): $first_symlink (in $label)"
     fi
 }
 
@@ -989,7 +1099,8 @@ collect_managed_file() {
     local source_file="$1"
     local repository_file="$2"
 
-    reject_managed_symlink "$source_file"
+    # Path-component validation is performed by the caller (collect_local_files)
+    # before entering this function — no per-file symlink check needed here.
 
     if [[ -e "$source_file" ]]; then
         sync_file "$source_file" "$repository_file"
@@ -1246,6 +1357,10 @@ validate_dependencies
 validate_configuration
 show_tool_versions
 
+if [[ -L "$REPO_DIR" ]]; then
+    die "Repository directory must not be a symbolic link: $REPO_DIR"
+fi
+
 if repository_exists; then
     log "Repository is already initialised: $REPO_DIR"
     ensure_repository_structure
@@ -1350,7 +1465,52 @@ collect_local_files() {
 local path
 
 require_repository
+ensure_machine_name
+
+# Validate repository destination path components before
+# ensure_repository_structure creates directories or any files are written.
+# A symlink inside $REPO_DIR (from a prior compromised push, manual edit, or
+# NAS restore) could redirect mkdir -p or rsync writes outside the
+# repository.
+for path in "${MANAGED_DIRECTORIES[@]}"; do
+    reject_symlink_components "$REPO_DIR" "home/$path" "repo: home/$path"
+done
+
+for path in "${MANAGED_FILES[@]}"; do
+    reject_symlink_components "$REPO_DIR" "home/$path" "repo: home/$path"
+done
+
+for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
+    reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo: machines/$MACHINE/home/$path"
+done
+
+for path in "${MACHINE_FILES[@]}"; do
+    reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo: machines/$MACHINE/home/$path"
+done
+
 ensure_repository_structure
+
+# Validate every path component from $HOME to each managed leaf, and scan
+# existing repository destination directories for interior symlinks, before
+# any sync runs.
+for path in "${MANAGED_DIRECTORIES[@]}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+    reject_symlinks_in_directory "$(local_path "$path")" "~/$path"
+    reject_symlinks_in_directory "$(repository_path "$path")" "repo: home/$path"
+done
+
+for path in "${MANAGED_FILES[@]}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+done
+
+for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+    reject_symlinks_in_directory "$(machine_repository_path "$path")" "repo: machines/$MACHINE/home/$path"
+done
+
+for path in "${MACHINE_FILES[@]}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+done
 
 for path in "${MANAGED_DIRECTORIES[@]}"; do
     log "Copying ~/$path into the repository"
@@ -1372,6 +1532,7 @@ done
 
 for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
     if [[ -d "$(local_path "$path")" ]]; then
+        reject_symlinks_in_directory "$(local_path "$path")" "~/$path"
         log "Copying ~/$path into the repository (machine: $MACHINE)"
 
         run mkdir -p "$(machine_repository_path "$path")"
@@ -1715,10 +1876,11 @@ check_for_unrestored_remote_changes() {
         local local_file
         local_file="$(local_path "$home_relative")"
 
-        # Reject symlinks — the content comparisons below follow links,
-        # which would silently proxy the target's content and produce
-        # unreliable staleness results.
-        reject_managed_symlink "$local_file" "~/$home_relative"
+        # Reject symlinks at any component between $HOME and the managed
+        # leaf — the content comparisons below follow links, which would
+        # silently proxy the target's content and produce unreliable
+        # staleness results.
+        reject_symlink_components "$HOME" "$home_relative" "~/$home_relative"
 
         case "$status" in
             M)
@@ -1924,9 +2086,32 @@ require_repository
 [[ -d "$REPO_DIR/home" ]] ||
     die "Repository does not contain the expected home directory."
 
+# Validate every path component from $HOME to each managed leaf before
+# backup or restore runs. rsync --delete follows destination symlinks, so a
+# symlink at any component could redirect reads (backup) or writes (restore)
+# outside the intended managed tree. Checking here (before create_local_backup)
+# protects both the backup source reads and the restore destination writes.
+for path in "${MANAGED_DIRECTORIES[@]}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+done
+
+for path in "${MANAGED_FILES[@]}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+done
+
+for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+done
+
+for path in "${MACHINE_FILES[@]}"; do
+    reject_symlink_components "$HOME" "$path" "~/$path"
+done
+
 create_local_backup
 
 for path in "${MANAGED_DIRECTORIES[@]}"; do
+    reject_symlink_components "$REPO_DIR" "home/$path" "repo:home/$path"
+    reject_symlinks_in_directory "$(repository_path "$path")" "repo:home/$path"
     log "Restoring ~/$path"
 
     sync_directory \
@@ -1937,6 +2122,7 @@ for path in "${MANAGED_DIRECTORIES[@]}"; do
 done
 
 for path in "${MANAGED_FILES[@]}"; do
+    reject_symlink_components "$REPO_DIR" "home/$path" "repo:home/$path"
     log "Restoring ~/$path"
 
     sync_file \
@@ -1951,6 +2137,8 @@ ensure_machine_name
 if [[ -d "$(machine_repository_root)/home" ]]; then
     for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
         if [[ -d "$(machine_repository_path "$path")" ]]; then
+            reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo:machines/$MACHINE/home/$path"
+            reject_symlinks_in_directory "$(machine_repository_path "$path")" "repo:machines/$MACHINE/home/$path"
             log "Restoring ~/$path (machine: $MACHINE)"
 
             sync_directory \
@@ -1965,6 +2153,7 @@ if [[ -d "$(machine_repository_root)/home" ]]; then
 
     for path in "${MACHINE_FILES[@]}"; do
         if [[ -f "$(machine_repository_path "$path")" ]]; then
+            reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo:machines/$MACHINE/home/$path"
             log "Restoring ~/$path (machine: $MACHINE)"
 
             sync_file \
