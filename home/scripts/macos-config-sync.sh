@@ -2,7 +2,14 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.7.0
+# Version: 2.7.1
+#
+# v2.7.1:
+#   - Fixed (Low): NAS mirror rsync reported permission changes on every file
+#     and directory because --archive implies --perms, but SMB mounts cannot
+#     preserve Unix permission bits. Added --no-perms to the NAS mirror and
+#     NAS restore rsync invocations so permissions are neither set nor compared
+#     on the network mount.
 #
 # v2.7.0:
 #   - Improved: Colourised terminal output following the style used in
@@ -260,7 +267,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.7.0"
+readonly SCRIPT_VERSION="2.7.1"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -1954,8 +1961,12 @@ run mkdir -p "$NAS_REPO_DIR"
 # relying solely on mtime/size, which guards against silent data corruption
 # on network mounts (SMB/NFS). The performance cost is negligible for a
 # small configuration repository.
+# --no-perms prevents rsync from setting or comparing Unix permission bits,
+# which SMB mounts cannot preserve — without it, every file is reported as
+# changed on every run.
 run rsync \
     "${COMMON_RSYNC_OPTIONS[@]}" \
+    --no-perms \
     --checksum \
     --delete \
     --delete-excluded \
@@ -1984,8 +1995,12 @@ step "Restoring local repository files from NAS"
 
 run mkdir -p "$(dirname "$REPO_DIR")"
 
+# --no-perms: the NAS cannot store Unix permission bits, so the values it
+# reports are meaningless mount-level defaults. Omitting them lets the
+# restored files inherit permissions from the local umask instead.
 run rsync \
     "${COMMON_RSYNC_OPTIONS[@]}" \
+    --no-perms \
     "$NAS_REPO_DIR/" \
     "$REPO_DIR/"
 
