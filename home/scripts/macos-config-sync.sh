@@ -5,11 +5,15 @@
 # Version: 2.7.1
 #
 # v2.7.1:
-#   - Fixed (Low): NAS mirror rsync reported permission changes on every file
-#     and directory because --archive implies --perms, but SMB mounts cannot
-#     preserve Unix permission bits. Added --no-perms to the NAS mirror and
-#     NAS restore rsync invocations so permissions are neither set nor compared
-#     on the network mount.
+#   - Improved: NAS synchronisation now prefers rsync-over-SSH when the NAS
+#     host is reachable, preserving Unix permissions correctly. Falls back
+#     to the SMB mount path automatically when SSH is unavailable.
+#   - Added: NAS_SSH_HOST environment variable (default: homestorage) to
+#     configure the NAS hostname for SSH transport. NAS_SSH_DIR (default:
+#     ~/macos-config) sets the remote repository path.
+#   - Fixed (Low): SMB fallback uses --no-perms to suppress the spurious
+#     permission changes reported on every file because SMB mounts cannot
+#     preserve Unix permission bits.
 #
 # v2.7.0:
 #   - Improved: Colourised terminal output following the style used in
@@ -284,6 +288,12 @@ REPO_DIR="${REPO_DIR:-$HOME/.local/share/macos-config}"
 
 NAS_ROOT="${NAS_ROOT:-/Volumes/home}"
 NAS_REPO_DIR="${NAS_REPO_DIR:-$NAS_ROOT/macos-config}"
+
+# SSH transport for NAS synchronisation (preferred over SMB).
+# The remote user is not specified — it mirrors the local account name,
+# so rsync connects as the current user by default.
+NAS_SSH_HOST="${NAS_SSH_HOST:-homestorage}"
+NAS_SSH_DIR="${NAS_SSH_DIR:-~/macos-config}"
 
 BACKUP_ROOT="${BACKUP_ROOT:-$HOME/.local/state/macos-config/backups}"
 BACKUP_RETENTION="${BACKUP_RETENTION:-10}"
@@ -631,8 +641,10 @@ Environment overrides:
   GITHUB_REPO
   GIT_BRANCH
   REPO_DIR
-  NAS_ROOT
-  NAS_REPO_DIR
+  NAS_SSH_HOST    NAS hostname for SSH transport (default: homestorage)
+  NAS_SSH_DIR     Remote repository path over SSH (default: ~/macos-config)
+  NAS_ROOT        SMB mount point fallback (default: /Volumes/home)
+  NAS_REPO_DIR    SMB repository path fallback (default: \$NAS_ROOT/macos-config)
   BACKUP_ROOT
   BACKUP_RETENTION
   LOCK_DIR
@@ -822,13 +834,24 @@ ensure_repository_structure() {
 # NAS helpers
 # ----
 
-nas_available() {
+nas_ssh_available() {
+    ssh -n \
+        -o BatchMode=yes \
+        -o ConnectTimeout=3 \
+        "$NAS_SSH_HOST" true 2>/dev/null
+}
+
+nas_smb_available() {
     [[ -d "$NAS_ROOT" ]]
+}
+
+nas_available() {
+    nas_ssh_available || nas_smb_available
 }
 
 require_nas() {
     nas_available ||
-        die "NAS root is unavailable: $NAS_ROOT"
+        die "NAS is unreachable (SSH host: $NAS_SSH_HOST, SMB mount: $NAS_ROOT)"
 }
 
 # ----
@@ -1945,37 +1968,53 @@ restore_local_files
 mirror_repository_to_nas() {
 require_repository
 
-if ! nas_available; then
-    warn "NAS is not mounted at: $NAS_ROOT"
-    warn "The GitHub operation completed, but the NAS mirror was not updated."
-    return 0
-fi
-
-step "Mirroring repository files to NAS: $NAS_REPO_DIR"
-
-run mkdir -p "$NAS_REPO_DIR"
-
 # --delete-excluded removes excluded paths (such as a pre-existing .git
 # directory) from the NAS mirror. --delete alone protects excluded paths.
 # --checksum verifies file integrity by comparing checksums rather than
 # relying solely on mtime/size, which guards against silent data corruption
 # on network mounts (SMB/NFS). The performance cost is negligible for a
 # small configuration repository.
-# --no-perms prevents rsync from setting or comparing Unix permission bits,
-# which SMB mounts cannot preserve — without it, every file is reported as
-# changed on every run.
-run rsync \
-    "${COMMON_RSYNC_OPTIONS[@]}" \
-    --no-perms \
-    --checksum \
-    --delete \
-    --delete-excluded \
-    --exclude='.git/' \
-    --exclude='.DS_Store' \
-    "$REPO_DIR/" \
-    "$NAS_REPO_DIR/"
+local -a nas_mirror_options=(
+    --checksum
+    --delete
+    --delete-excluded
+    --exclude='.git/'
+    --exclude='.DS_Store'
+)
 
-ok "NAS mirror updated"
+if nas_ssh_available; then
+    step "Mirroring repository files to NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
+
+    # SSH preserves Unix permissions natively — no --no-perms needed.
+    # mkdir -p on the remote in case this is the first run.
+    run ssh -n "$NAS_SSH_HOST" "mkdir -p \"$NAS_SSH_DIR\""
+
+    run rsync \
+        "${COMMON_RSYNC_OPTIONS[@]}" \
+        "${nas_mirror_options[@]}" \
+        "$REPO_DIR/" \
+        "$NAS_SSH_HOST:$NAS_SSH_DIR/"
+
+    ok "NAS mirror updated (SSH)"
+elif nas_smb_available; then
+    step "Mirroring repository files to NAS via SMB: $NAS_REPO_DIR"
+
+    run mkdir -p "$NAS_REPO_DIR"
+
+    # --no-perms: SMB mounts cannot preserve Unix permission bits — without
+    # it, every file is reported as changed on every run.
+    run rsync \
+        "${COMMON_RSYNC_OPTIONS[@]}" \
+        --no-perms \
+        "${nas_mirror_options[@]}" \
+        "$REPO_DIR/" \
+        "$NAS_REPO_DIR/"
+
+    ok "NAS mirror updated (SMB)"
+else
+    warn "NAS is unreachable (SSH host: $NAS_SSH_HOST, SMB mount: $NAS_ROOT)"
+    warn "The GitHub operation completed, but the NAS mirror was not updated."
+fi
 }
 
 restore_repository_from_nas() {
@@ -1984,25 +2023,44 @@ validate_configuration
 require_nas
 show_tool_versions
 
-[[ -d "$NAS_REPO_DIR/home" ]] ||
-    die "No repository mirror was found at: $NAS_REPO_DIR"
-
 if [[ -e "$REPO_DIR" ]]; then
     die "Local repository already exists: $REPO_DIR"
 fi
 
-step "Restoring local repository files from NAS"
-
 run mkdir -p "$(dirname "$REPO_DIR")"
 
-# --no-perms: the NAS cannot store Unix permission bits, so the values it
-# reports are meaningless mount-level defaults. Omitting them lets the
-# restored files inherit permissions from the local umask instead.
-run rsync \
-    "${COMMON_RSYNC_OPTIONS[@]}" \
-    --no-perms \
-    "$NAS_REPO_DIR/" \
-    "$REPO_DIR/"
+if nas_ssh_available; then
+    # Verify the remote mirror exists before pulling.
+    ssh -n "$NAS_SSH_HOST" "test -d \"$NAS_SSH_DIR/home\"" ||
+        die "No repository mirror was found at: $NAS_SSH_HOST:$NAS_SSH_DIR"
+
+    step "Restoring local repository files from NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
+
+    run rsync \
+        "${COMMON_RSYNC_OPTIONS[@]}" \
+        "$NAS_SSH_HOST:$NAS_SSH_DIR/" \
+        "$REPO_DIR/"
+
+    ok "Repository files restored (SSH)"
+elif nas_smb_available; then
+    [[ -d "$NAS_REPO_DIR/home" ]] ||
+        die "No repository mirror was found at: $NAS_REPO_DIR"
+
+    step "Restoring local repository files from NAS via SMB: $NAS_REPO_DIR"
+
+    # --no-perms: the SMB mount cannot store Unix permission bits, so the
+    # values it reports are meaningless mount-level defaults. Omitting them
+    # lets the restored files inherit permissions from the local umask.
+    run rsync \
+        "${COMMON_RSYNC_OPTIONS[@]}" \
+        --no-perms \
+        "$NAS_REPO_DIR/" \
+        "$REPO_DIR/"
+
+    ok "Repository files restored (SMB)"
+else
+    die "NAS is unreachable (SSH host: $NAS_SSH_HOST, SMB mount: $NAS_ROOT)"
+fi
 
 step "Re-attaching Git history from GitHub"
 
@@ -2041,8 +2099,10 @@ printf '\n'
 printf '%sGitHub repository:%s %s\n' "$C_BLUE" "$C_RESET" "$GITHUB_REPO"
 printf '%sGit branch:%s        %s\n' "$C_BLUE" "$C_RESET" "$GIT_BRANCH"
 printf '%sLocal repository:%s  %s\n' "$C_BLUE" "$C_RESET" "$REPO_DIR"
-printf '%sNAS root:%s          %s\n' "$C_BLUE" "$C_RESET" "$NAS_ROOT"
-printf '%sNAS repository:%s    %s\n' "$C_BLUE" "$C_RESET" "$NAS_REPO_DIR"
+printf '%sNAS SSH host:%s       %s\n' "$C_BLUE" "$C_RESET" "$NAS_SSH_HOST"
+printf '%sNAS SSH directory:%s  %s\n' "$C_BLUE" "$C_RESET" "$NAS_SSH_DIR"
+printf '%sNAS SMB root:%s       %s\n' "$C_BLUE" "$C_RESET" "$NAS_ROOT"
+printf '%sNAS SMB repository:%s %s\n' "$C_BLUE" "$C_RESET" "$NAS_REPO_DIR"
 printf '%sBackup directory:%s  %s\n' "$C_BLUE" "$C_RESET" "$BACKUP_ROOT"
 printf '%sBackup retention:%s  %s\n' "$C_BLUE" "$C_RESET" "$BACKUP_RETENTION"
 printf '%sMachine name:%s      %s\n' "$C_BLUE" "$C_RESET" "$MACHINE"
@@ -2095,16 +2155,28 @@ fi
 
 printf '\n'
 
-if nas_available; then
-    printf '%s✔ NAS root is mounted:%s %s\n' "$C_GREEN" "$C_RESET" "$NAS_ROOT"
+if nas_ssh_available; then
+    printf '%s✔ NAS SSH is reachable:%s %s\n' "$C_GREEN" "$C_RESET" "$NAS_SSH_HOST"
 
-    if [[ -d "$NAS_REPO_DIR/home" ]]; then
-        printf '%s✔ NAS repository mirror is present.%s\n' "$C_GREEN" "$C_RESET"
+    if ssh -n "$NAS_SSH_HOST" "test -d \"$NAS_SSH_DIR/home\"" 2>/dev/null; then
+        printf '%s✔ NAS repository mirror is present (SSH).%s\n' "$C_GREEN" "$C_RESET"
     else
-        printf '%s✘ NAS repository mirror is not present.%s\n' "$C_YELLOW" "$C_RESET"
+        printf '%s✘ NAS repository mirror is not present (SSH).%s\n' "$C_YELLOW" "$C_RESET"
     fi
 else
-    printf '%s✘ NAS root is not mounted:%s %s\n' "$C_RED" "$C_RESET" "$NAS_ROOT"
+    printf '%s✘ NAS SSH is not reachable:%s %s\n' "$C_RED" "$C_RESET" "$NAS_SSH_HOST"
+fi
+
+if nas_smb_available; then
+    printf '%s✔ NAS SMB is mounted:%s %s\n' "$C_GREEN" "$C_RESET" "$NAS_ROOT"
+
+    if [[ -d "$NAS_REPO_DIR/home" ]]; then
+        printf '%s✔ NAS repository mirror is present (SMB).%s\n' "$C_GREEN" "$C_RESET"
+    else
+        printf '%s✘ NAS repository mirror is not present (SMB).%s\n' "$C_YELLOW" "$C_RESET"
+    fi
+else
+    printf '%s✘ NAS SMB is not mounted:%s %s\n' "$C_RED" "$C_RESET" "$NAS_ROOT"
 fi
 }
 
