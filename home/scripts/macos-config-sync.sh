@@ -26,6 +26,11 @@
 #     Synology NAS use a minimal PATH that resolves to the stock 3.1.x
 #     rsync instead of the Entware 3.4.x+ build, causing protocol
 #     mismatches and connection failures.
+#   - Fixed (Medium): Remote shell commands (--rsync-path mkdir, ssh test -d)
+#     passed NAS_SSH_DIR inside double quotes, preventing tilde expansion on
+#     the remote shell and creating a literal ~/macos-config directory. The
+#     value is now unquoted in remote commands so the remote sh expands ~ to
+#     the user's home directory.
 #   - Fixed (Low): SMB fallback uses --no-perms to suppress the spurious
 #     permission changes reported on every file because SMB mounts cannot
 #     preserve Unix permission bits.
@@ -308,6 +313,10 @@ NAS_REPO_DIR="${NAS_REPO_DIR:-$NAS_ROOT/macos-config}"
 # The remote user is not specified — it mirrors the local account name,
 # so rsync connects as the current user by default.
 NAS_SSH_HOST="${NAS_SSH_HOST:-homestorage}"
+
+# The default uses a literal tilde — it is NOT expanded locally. rsync
+# expands ~ in host:~/path destinations, and remote shell commands leave
+# the value UNQUOTED so the remote sh expands the tilde at execution time.
 NAS_SSH_DIR="${NAS_SSH_DIR:-~/macos-config}"
 
 # Path to the rsync binary on the NAS. Non-interactive SSH sessions use a
@@ -2021,7 +2030,7 @@ if nas_ssh_available; then
     # the remote shell's PATH.
     run rsync \
         -e "$NAS_SSH_CMD" \
-        --rsync-path="mkdir -p \"$NAS_SSH_DIR\" && $NAS_RSYNC_PATH" \
+        --rsync-path="mkdir -p $NAS_SSH_DIR && $NAS_RSYNC_PATH" \
         "${COMMON_RSYNC_OPTIONS[@]}" \
         "${nas_mirror_options[@]}" \
         "$REPO_DIR/" \
@@ -2064,7 +2073,7 @@ run mkdir -p "$(dirname "$REPO_DIR")"
 if nas_ssh_available; then
     # Verify the remote mirror exists before pulling.
     ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" \
-        "test -d \"$NAS_SSH_DIR/home\"" ||
+        "test -d $NAS_SSH_DIR/home" ||
         die "No repository mirror was found at: $NAS_SSH_HOST:$NAS_SSH_DIR"
 
     step "Restoring local repository files from NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
@@ -2193,7 +2202,7 @@ printf '\n'
 if nas_ssh_available; then
     printf '%s✔ NAS SSH is reachable:%s %s\n' "$C_GREEN" "$C_RESET" "$NAS_SSH_HOST"
 
-    if ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" "test -d \"$NAS_SSH_DIR/home\"" 2>/dev/null; then
+    if ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" "test -d $NAS_SSH_DIR/home" 2>/dev/null; then
         printf '%s✔ NAS repository mirror is present (SSH).%s\n' "$C_GREEN" "$C_RESET"
     else
         printf '%s✘ NAS repository mirror is not present (SSH).%s\n' "$C_YELLOW" "$C_RESET"
