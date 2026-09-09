@@ -5,11 +5,11 @@
 # Version: 2.6.2
 #
 # v2.6.2:
-#   - Fixed (Medium): restore_local_files now creates ~/.ssh/sockets/ if
-#     it does not exist. The sync script manages ~/.ssh/config (which may
-#     set ControlPath to this directory) but not the directory itself, so
-#     a fresh bootstrap left SSH multiplexing broken — git operations fell
-#     back to direct connections on port 22 and timed out.
+#   - Fixed (Medium): The ~/.ssh/sockets/ directory documented in v2.5.0
+#     was missing from restore_local_files — a fresh bootstrap left SSH
+#     multiplexing broken and git operations fell back to direct
+#     connections on port 22, which timed out. The directory is now
+#     created (mode 700) alongside the existing ~/.ssh permissions block.
 #
 # v2.6.1:
 #   - Fixed (Low): Removed deprecated --describe flag from brew bundle
@@ -33,6 +33,10 @@
 #     for the directory, 600 for its files) after restoring, matching the
 #     existing ~/.gnupg treatment. SSH refuses to use a config file that
 #     is group- or world-readable.
+#   - restore_local_files creates ~/.ssh/sockets/ (mode 700) if it does
+#     not already exist. The managed ~/.ssh/config sets ControlPath to
+#     this directory for SSH connection multiplexing; without it, SSH
+#     silently falls back to individual connections per invocation.
 #
 # v2.4.1:
 #   - Fixed (High): Staleness guard A handler now applies the same three-
