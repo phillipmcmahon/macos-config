@@ -2,7 +2,14 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.6.1
+# Version: 2.6.2
+#
+# v2.6.2:
+#   - Fixed (Medium): restore_local_files now creates ~/.ssh/sockets/ if
+#     it does not exist. The sync script manages ~/.ssh/config (which may
+#     set ControlPath to this directory) but not the directory itself, so
+#     a fresh bootstrap left SSH multiplexing broken — git operations fell
+#     back to direct connections on port 22 and timed out.
 #
 # v2.6.1:
 #   - Fixed (Low): Removed deprecated --describe flag from brew bundle
@@ -242,7 +249,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.6.1"
+readonly SCRIPT_VERSION="2.6.2"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -1824,8 +1831,13 @@ fi
 
 # SSH refuses to use a config file (or key files) that are group- or
 # world-readable. Apply the same restrictive permissions as ~/.gnupg.
+# Also ensure the ControlPath sockets directory exists — the sync script
+# manages ~/.ssh/config (which may reference it) but not the directory
+# itself, so a fresh restore would leave multiplexing broken.
 if [[ -d "$HOME/.ssh" ]]; then
     run chmod 700 "$HOME/.ssh"
+    run mkdir -p "$HOME/.ssh/sockets"
+    run chmod 700 "$HOME/.ssh/sockets"
     run find "$HOME/.ssh" \
         -type f \
         -exec chmod 600 {} +
