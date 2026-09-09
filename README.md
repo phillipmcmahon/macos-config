@@ -13,6 +13,7 @@ Stored beneath the repository's `home` directory and restored on every machine.
 - `~/.gnupg/gpg.conf`
 - `~/.gnupg/scdaemon.conf`
 - `~/.gnupg/sshcontrol`
+- `~/.ssh/config`
 - `~/.zprofile`
 - `~/.zshenv`
 - `~/.zshrc`

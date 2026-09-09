@@ -2,7 +2,16 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.4.1
+# Version: 2.5.0
+#
+# v2.5.0:
+#   - New: ~/.ssh/config is now a shared managed file, synced across all
+#     machines. Enables consistent SSH connection policy (multiplexing,
+#     port overrides) without per-machine setup.
+#   - restore_local_files now sets restrictive permissions on ~/.ssh (700
+#     for the directory, 600 for its files) after restoring, matching the
+#     existing ~/.gnupg treatment. SSH refuses to use a config file that
+#     is group- or world-readable.
 #
 # v2.4.1:
 #   - Fixed (High): Staleness guard A handler now applies the same three-
@@ -219,7 +228,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.4.1"
+readonly SCRIPT_VERSION="2.5.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -284,6 +293,7 @@ MANAGED_FILES=(
     ".gnupg/gpg.conf"
     ".gnupg/scdaemon.conf"
     ".gnupg/sshcontrol"
+    ".ssh/config"
     ".zprofile"
     ".zshenv"
     ".zshrc"
@@ -1776,6 +1786,15 @@ if [[ -d "$HOME/.gnupg" ]]; then
         -exec chmod 600 {} +
 fi
 
+# SSH refuses to use a config file (or key files) that are group- or
+# world-readable. Apply the same restrictive permissions as ~/.gnupg.
+if [[ -d "$HOME/.ssh" ]]; then
+    run chmod 700 "$HOME/.ssh"
+    run find "$HOME/.ssh" \
+        -type f \
+        -exec chmod 600 {} +
+fi
+
 prune_local_backups
 
 log "Configuration restored"
@@ -2043,3 +2062,4 @@ esac
 }
 
 main "$@"
+
