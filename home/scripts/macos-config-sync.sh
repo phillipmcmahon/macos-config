@@ -1076,6 +1076,15 @@ The Brewfile is machine-specific (`machines/<machine-name>/home/Brewfile`). Afte
 ```bash
 brew bundle --file="$HOME/Brewfile"
 ```
+
+## SSH
+
+`~/.ssh/config` is a shared managed file containing the SSH connection policy for `github.com` (port 443 tunnel and connection multiplexing). On restore, the sync script also:
+
+- Sets `~/.ssh` to mode 700 and all files within it to mode 600 (SSH refuses to use a config or key file that is group- or world-readable).
+- Creates `~/.ssh/sockets/` (mode 700) if it does not already exist. The `ControlPath` directive in `~/.ssh/config` points to this directory — without it, SSH silently falls back to opening a new connection for every git command, which is slower and prone to intermittent timeouts.
+
+The sockets directory is not tracked in Git (it only holds transient Unix domain sockets created by SSH at runtime). It is created automatically by `pull`, `restore`, and `bootstrap.sh`.
 EOF
 } >"$readme"
 }
