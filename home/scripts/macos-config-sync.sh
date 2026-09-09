@@ -11,6 +11,15 @@
 #   - Added: NAS_SSH_HOST environment variable (default: homestorage) to
 #     configure the NAS hostname for SSH transport. NAS_SSH_DIR (default:
 #     ~/macos-config) sets the remote repository path.
+#   - Added: All NAS SSH connections use a shared NAS_SSH_OPTS array
+#     (-o BatchMode=yes -o ConnectTimeout=3). BatchMode enforces key-only
+#     auth so a failed key exchange fails immediately instead of falling
+#     through to password prompting. rsync receives the same options via
+#     -e "ssh ${NAS_SSH_OPTS[*]}".
+#   - Improved: The remote directory is created via --rsync-path rather than
+#     a separate ssh mkdir call, reducing the number of SSH connections per
+#     push from three to two (probe + rsync) to avoid tripping brute-force
+#     protections on the NAS.
 #   - Fixed (Low): SMB fallback uses --no-perms to suppress the spurious
 #     permission changes reported on every file because SMB mounts cannot
 #     preserve Unix permission bits.
@@ -834,11 +843,13 @@ ensure_repository_structure() {
 # NAS helpers
 # ----
 
+# Common SSH options for all NAS connections. BatchMode prevents password
+# prompts — if key authentication fails, the connection fails immediately
+# instead of hanging or triggering brute-force protections on the NAS.
+NAS_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=3)
+
 nas_ssh_available() {
-    ssh -n \
-        -o BatchMode=yes \
-        -o ConnectTimeout=3 \
-        "$NAS_SSH_HOST" true 2>/dev/null
+    ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" true 2>/dev/null
 }
 
 nas_smb_available() {
@@ -1986,10 +1997,12 @@ if nas_ssh_available; then
     step "Mirroring repository files to NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
 
     # SSH preserves Unix permissions natively — no --no-perms needed.
-    # mkdir -p on the remote in case this is the first run.
-    run ssh -n "$NAS_SSH_HOST" "mkdir -p \"$NAS_SSH_DIR\""
-
+    # --rsync-path creates the remote directory on the first run using
+    # the same SSH connection as the transfer, avoiding a separate
+    # connection that could trip brute-force protections on the NAS.
     run rsync \
+        -e "ssh ${NAS_SSH_OPTS[*]}" \
+        --rsync-path="mkdir -p \"$NAS_SSH_DIR\" && rsync" \
         "${COMMON_RSYNC_OPTIONS[@]}" \
         "${nas_mirror_options[@]}" \
         "$REPO_DIR/" \
@@ -2031,12 +2044,14 @@ run mkdir -p "$(dirname "$REPO_DIR")"
 
 if nas_ssh_available; then
     # Verify the remote mirror exists before pulling.
-    ssh -n "$NAS_SSH_HOST" "test -d \"$NAS_SSH_DIR/home\"" ||
+    ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" \
+        "test -d \"$NAS_SSH_DIR/home\"" ||
         die "No repository mirror was found at: $NAS_SSH_HOST:$NAS_SSH_DIR"
 
     step "Restoring local repository files from NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
 
     run rsync \
+        -e "ssh ${NAS_SSH_OPTS[*]}" \
         "${COMMON_RSYNC_OPTIONS[@]}" \
         "$NAS_SSH_HOST:$NAS_SSH_DIR/" \
         "$REPO_DIR/"
@@ -2158,7 +2173,7 @@ printf '\n'
 if nas_ssh_available; then
     printf '%s✔ NAS SSH is reachable:%s %s\n' "$C_GREEN" "$C_RESET" "$NAS_SSH_HOST"
 
-    if ssh -n "$NAS_SSH_HOST" "test -d \"$NAS_SSH_DIR/home\"" 2>/dev/null; then
+    if ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" "test -d \"$NAS_SSH_DIR/home\"" 2>/dev/null; then
         printf '%s✔ NAS repository mirror is present (SSH).%s\n' "$C_GREEN" "$C_RESET"
     else
         printf '%s✘ NAS repository mirror is not present (SSH).%s\n' "$C_YELLOW" "$C_RESET"
