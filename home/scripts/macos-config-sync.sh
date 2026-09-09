@@ -2,7 +2,25 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.7.1
+# Version: 2.7.2
+#
+# v2.7.2:
+#   - Fixed (Medium): NAS_SSH_DIR is interpolated into remote shell commands
+#     (--rsync-path and ssh "test -d ...") without quoting. Added validation
+#     in validate_configuration() that rejects empty values, absolute paths,
+#     tilde prefixes, path traversal (..), and shell metacharacters — only
+#     alphanumerics, hyphens, underscores, dots, and forward slashes are
+#     permitted.
+#   - Fixed (Medium): restore_repository_from_nas() probed SSH availability
+#     twice — once inside require_nas() and again in the if-branch that
+#     chooses the transport. mirror_repository_to_nas() had the same
+#     structure. Both functions now resolve the transport once into a local
+#     variable and reuse it.
+#   - Fixed (Low): Symbolic links among managed files are now rejected with
+#     a fatal error. The sync and staleness-guard logic compares file
+#     content directly; a symlink would silently proxy its target's content,
+#     making comparisons unreliable and potentially leaking files outside
+#     the managed set into the repository.
 #
 # v2.7.1:
 #   - Improved: NAS synchronisation now prefers rsync-over-SSH when the NAS
@@ -293,7 +311,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.7.1"
+readonly SCRIPT_VERSION="2.7.2"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -747,6 +765,23 @@ validate_configuration() {
     [[ "$FORCE_PUSH" == "0" || "$FORCE_PUSH" == "1" ]] ||
         die "FORCE_PUSH must be either 0 or 1."
 
+    # NAS_SSH_DIR is interpolated into remote shell commands (--rsync-path
+    # and ssh "test -d ..."). Restrict it to a safe relative path to prevent
+    # shell injection.
+    if [[ -z "$NAS_SSH_DIR" ]]; then
+        die "NAS_SSH_DIR must not be empty."
+    fi
+    if [[ "$NAS_SSH_DIR" == /* || "$NAS_SSH_DIR" == "~"* ]]; then
+        die "NAS_SSH_DIR must be a relative path (no leading / or ~): $NAS_SSH_DIR"
+    fi
+    if [[ "$NAS_SSH_DIR" == ".." || "$NAS_SSH_DIR" == ../* \
+       || "$NAS_SSH_DIR" == */../* || "$NAS_SSH_DIR" == */.. ]]; then
+        die "NAS_SSH_DIR must not contain path traversal (..): $NAS_SSH_DIR"
+    fi
+    if [[ "$NAS_SSH_DIR" =~ [^a-zA-Z0-9_./-] ]]; then
+        die "NAS_SSH_DIR contains unsafe characters (only alphanumerics, hyphens, underscores, dots, and / are allowed): $NAS_SSH_DIR"
+    fi
+
     for path in "${MANAGED_DIRECTORIES[@]}"; do
         validate_managed_path "$path"
     done
@@ -937,11 +972,26 @@ sync_file() {
         "$destination_file"
 }
 
+# Reject symbolic links among managed files. The sync and staleness-guard
+# logic compares file content directly; a symlink would silently proxy its
+# target's content, making comparisons unreliable and potentially leaking
+# files outside the managed set into the repository.
+reject_managed_symlink() {
+    local file_path="$1"
+    local label="${2:-$file_path}"
+
+    if [[ -L "$file_path" ]]; then
+        die "Managed file is a symbolic link (not supported): $label"
+    fi
+}
+
 collect_managed_file() {
     local source_file="$1"
     local repository_file="$2"
 
-    if [[ -e "$source_file" || -L "$source_file" ]]; then
+    reject_managed_symlink "$source_file"
+
+    if [[ -e "$source_file" ]]; then
         sync_file "$source_file" "$repository_file"
         return 0
     fi
@@ -1665,6 +1715,11 @@ check_for_unrestored_remote_changes() {
         local local_file
         local_file="$(local_path "$home_relative")"
 
+        # Reject symlinks — the content comparisons below follow links,
+        # which would silently proxy the target's content and produce
+        # unreliable staleness results.
+        reject_managed_symlink "$local_file" "~/$home_relative"
+
         case "$status" in
             M)
                 # Modified by the remote.
@@ -2023,7 +2078,15 @@ local -a nas_mirror_options=(
     --exclude='.DS_Store'
 )
 
+# Resolve the NAS transport once to avoid redundant SSH probes.
+local nas_transport=""
 if nas_ssh_available; then
+    nas_transport=ssh
+elif nas_smb_available; then
+    nas_transport=smb
+fi
+
+if [[ "$nas_transport" == "ssh" ]]; then
     step "Mirroring repository files to NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
 
     # SSH preserves Unix permissions natively — no --no-perms needed.
@@ -2040,7 +2103,7 @@ if nas_ssh_available; then
         "$NAS_SSH_HOST:$NAS_SSH_DIR/"
 
     ok "NAS mirror updated (SSH)"
-elif nas_smb_available; then
+elif [[ "$nas_transport" == "smb" ]]; then
     step "Mirroring repository files to NAS via SMB: $NAS_REPO_DIR"
 
     run mkdir -p "$NAS_REPO_DIR"
@@ -2064,8 +2127,17 @@ fi
 restore_repository_from_nas() {
 validate_dependencies
 validate_configuration
-require_nas
 show_tool_versions
+
+# Resolve the NAS transport once to avoid redundant SSH probes.
+local nas_transport=""
+if nas_ssh_available; then
+    nas_transport=ssh
+elif nas_smb_available; then
+    nas_transport=smb
+else
+    die "NAS is unreachable (SSH host: $NAS_SSH_HOST, SMB mount: $NAS_ROOT)"
+fi
 
 if [[ -e "$REPO_DIR" ]]; then
     die "Local repository already exists: $REPO_DIR"
@@ -2073,7 +2145,7 @@ fi
 
 run mkdir -p "$(dirname "$REPO_DIR")"
 
-if nas_ssh_available; then
+if [[ "$nas_transport" == "ssh" ]]; then
     # Verify the remote mirror exists before pulling.
     ssh -n "${NAS_SSH_OPTS[@]}" "$NAS_SSH_HOST" \
         "test -d $NAS_SSH_DIR/home" ||
@@ -2089,7 +2161,7 @@ if nas_ssh_available; then
         "$REPO_DIR/"
 
     ok "Repository files restored (SSH)"
-elif nas_smb_available; then
+else
     [[ -d "$NAS_REPO_DIR/home" ]] ||
         die "No repository mirror was found at: $NAS_REPO_DIR"
 
@@ -2105,8 +2177,6 @@ elif nas_smb_available; then
         "$REPO_DIR/"
 
     ok "Repository files restored (SMB)"
-else
-    die "NAS is unreachable (SSH host: $NAS_SSH_HOST, SMB mount: $NAS_ROOT)"
 fi
 
 step "Re-attaching Git history from GitHub"
