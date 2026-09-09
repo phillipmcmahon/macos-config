@@ -21,6 +21,11 @@
 #     a separate ssh mkdir call, reducing the number of SSH connections per
 #     push from three to two (probe + rsync) to avoid tripping brute-force
 #     protections on the NAS.
+#   - Added: NAS_RSYNC_PATH environment variable (default: /opt/bin/rsync)
+#     pins the remote rsync binary. Non-interactive SSH sessions on the
+#     Synology NAS use a minimal PATH that resolves to the stock 3.1.x
+#     rsync instead of the Entware 3.4.x+ build, causing protocol
+#     mismatches and connection failures.
 #   - Fixed (Low): SMB fallback uses --no-perms to suppress the spurious
 #     permission changes reported on every file because SMB mounts cannot
 #     preserve Unix permission bits.
@@ -304,6 +309,13 @@ NAS_REPO_DIR="${NAS_REPO_DIR:-$NAS_ROOT/macos-config}"
 # so rsync connects as the current user by default.
 NAS_SSH_HOST="${NAS_SSH_HOST:-homestorage}"
 NAS_SSH_DIR="${NAS_SSH_DIR:-~/macos-config}"
+
+# Path to the rsync binary on the NAS. Non-interactive SSH sessions use a
+# minimal PATH that resolves to the stock Synology rsync (/usr/bin/rsync,
+# 3.1.x) instead of the Entware build (/opt/bin/rsync, 3.4.x+). Pinning
+# the path ensures the correct version is used regardless of the remote
+# shell's PATH.
+NAS_RSYNC_PATH="${NAS_RSYNC_PATH:-/opt/bin/rsync}"
 
 BACKUP_ROOT="${BACKUP_ROOT:-$HOME/.local/state/macos-config/backups}"
 BACKUP_RETENTION="${BACKUP_RETENTION:-10}"
@@ -653,6 +665,7 @@ Environment overrides:
   REPO_DIR
   NAS_SSH_HOST    NAS hostname for SSH transport (default: homestorage)
   NAS_SSH_DIR     Remote repository path over SSH (default: ~/macos-config)
+  NAS_RSYNC_PATH  Remote rsync binary (default: /opt/bin/rsync)
   NAS_ROOT        SMB mount point fallback (default: /Volumes/home)
   NAS_REPO_DIR    SMB repository path fallback (default: \$NAS_ROOT/macos-config)
   BACKUP_ROOT
@@ -2002,12 +2015,13 @@ if nas_ssh_available; then
     step "Mirroring repository files to NAS via SSH: $NAS_SSH_HOST:$NAS_SSH_DIR"
 
     # SSH preserves Unix permissions natively — no --no-perms needed.
-    # --rsync-path creates the remote directory on the first run using
-    # the same SSH connection as the transfer, avoiding a separate
-    # connection that could trip brute-force protections on the NAS.
+    # --rsync-path serves two purposes: it creates the remote directory
+    # on the first run (avoiding a separate SSH connection) and it pins
+    # the NAS rsync binary so the correct version is used regardless of
+    # the remote shell's PATH.
     run rsync \
         -e "$NAS_SSH_CMD" \
-        --rsync-path="mkdir -p \"$NAS_SSH_DIR\" && rsync" \
+        --rsync-path="mkdir -p \"$NAS_SSH_DIR\" && $NAS_RSYNC_PATH" \
         "${COMMON_RSYNC_OPTIONS[@]}" \
         "${nas_mirror_options[@]}" \
         "$REPO_DIR/" \
@@ -2057,6 +2071,7 @@ if nas_ssh_available; then
 
     run rsync \
         -e "$NAS_SSH_CMD" \
+        --rsync-path="$NAS_RSYNC_PATH" \
         "${COMMON_RSYNC_OPTIONS[@]}" \
         "$NAS_SSH_HOST:$NAS_SSH_DIR/" \
         "$REPO_DIR/"
