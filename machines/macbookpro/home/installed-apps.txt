@@ -6,6 +6,7 @@ Better Dock
 Bitwarden
 Citrix Workspace
 Emby
+Feishin
 Firefox
 Google Chrome
 HandBrake
@@ -32,6 +33,7 @@ Safari
 SMBMounter
 SoundSource
 Spotify
+Supersonic
 Tailscale
 Task Manager TMOG
 UniFi Endpoint
