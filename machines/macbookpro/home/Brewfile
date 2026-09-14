@@ -58,6 +58,8 @@ cask "citrix-workspace"
 cask "emby"
 # Web browser
 cask "firefox"
+# Finder replacement and FTP, SFTP, WebDAV and Amazon s3 client
+cask "forklift"
 # Web browser
 cask "google-chrome"
 # Open-source video transcoder

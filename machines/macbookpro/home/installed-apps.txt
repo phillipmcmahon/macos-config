@@ -8,6 +8,7 @@ Citrix Workspace
 Emby
 Feishin
 Firefox
+ForkLift
 Google Chrome
 HandBrake
 Hazel
@@ -26,9 +27,12 @@ Mimestream
 Moom
 Mp3tag
 Mullvad VPN
+NaviBeat
 OneDrive
 OpenLogi
+Passepartout
 Plex
+Pure Paste
 Safari
 SMBMounter
 SoundSource
