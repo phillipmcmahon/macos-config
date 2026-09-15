@@ -2,7 +2,21 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.7.8
+# Version: 2.8.0
+#
+# v2.8.0:
+#   - New: Moom window-manager preferences (com.manytricks.Moom) are now
+#     exported on every push and imported on every pull/restore, using
+#     'defaults export' and 'defaults import' as recommended by the
+#     developer (https://manytricks.com/osticket/kb/faq.php?id=53).
+#   - The exported ~/Moom.plist is tracked as a machine-specific file
+#     (stored under machines/<machine-name>/home/ in the repository) so
+#     each Mac maintains its own independent window layout. Requires
+#     Moom to be quit before push/pull to avoid stale reads or ignored
+#     writes; the script warns but does not abort if pgrep detects a
+#     running Moom process.
+#   - Skipped with a warning if Moom is not installed (the defaults
+#     domain com.manytricks.Moom does not exist).
 #
 # v2.7.8:
 #   - Fixed (Medium): init bypasses require_repository() and calls
@@ -377,7 +391,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.7.8"
+readonly SCRIPT_VERSION="2.8.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -479,6 +493,7 @@ MACHINE_DIRECTORIES=(
 MACHINE_FILES=(
     "Brewfile"
     "installed-apps.txt"
+    "Moom.plist"
 )
 
 # Patterns excluded from every managed directory sync.
@@ -1352,6 +1367,12 @@ brew bundle --file="$HOME/Brewfile"
 - Creates `~/.ssh/sockets/` (mode 700) if it does not already exist. The `ControlPath` directive in `~/.ssh/config` points to this directory — without it, SSH silently falls back to opening a new connection for every git command, which is slower and prone to intermittent timeouts.
 
 The sockets directory is not tracked in Git (it only holds transient Unix domain sockets created by SSH at runtime). It is created automatically by `pull`, `restore`, and `bootstrap.sh`.
+
+## Moom
+
+[Moom](https://manytricks.com/moom/) window-layout preferences are exported on every push and imported on every pull/restore, using \`defaults export\` / \`defaults import\` as [recommended by the developer](https://manytricks.com/osticket/kb/faq.php?id=53). The exported \`Moom.plist\` is machine-specific (\`machines/<machine-name>/home/Moom.plist\`) because window layouts are typically tied to a machine's display configuration.
+
+**Important:** Quit Moom before running push or pull. While Moom is running it holds preferences in memory, so an export may read stale data and an import may be overwritten when Moom next saves. The script warns if a running Moom process is detected but does not abort — machines without Moom installed simply skip the export/import step.
 EOF
 } >"$readme"
 }
@@ -1463,6 +1484,74 @@ generate_installed_apps_list() {
     ) | LC_ALL=C sort -f >"$output_file"
 
     ok "Listed $(wc -l < "$output_file" | tr -d ' ') applications"
+}
+
+# ----
+# Moom preferences
+# ----
+#
+# Moom (https://manytricks.com/moom/) stores window layout preferences in
+# the macOS defaults system under the com.manytricks.Moom domain. The
+# developer recommends using 'defaults export' and 'defaults import' to
+# back up and restore settings (https://manytricks.com/osticket/kb/faq.php?id=53).
+#
+# The exported plist is tracked as a machine-specific file because window
+# layouts are typically tied to a machine's display configuration.
+#
+# Both functions warn if Moom is running — defaults reads and writes may
+# be stale or ignored while the application holds the preference domain
+# in memory.
+
+export_moom_preferences() {
+    local output_file
+    output_file="$(local_path "Moom.plist")"
+
+    # Skip entirely when Moom is not installed (the defaults domain will
+    # not exist).
+    if ! defaults read com.manytricks.Moom >/dev/null 2>&1; then
+        warn "Moom is not installed or has no saved preferences — skipping Moom export"
+        return 0
+    fi
+
+    if pgrep -xq "Moom" 2>/dev/null; then
+        warn "Moom is running — quit Moom before push for a consistent export"
+    fi
+
+    step "Exporting Moom preferences: $output_file"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY-RUN: Would export Moom preferences to $output_file"
+        return 0
+    fi
+
+    defaults export com.manytricks.Moom "$output_file"
+
+    ok "Moom preferences exported"
+}
+
+restore_moom_preferences() {
+    local input_file
+    input_file="$(local_path "Moom.plist")"
+
+    if [[ ! -f "$input_file" ]]; then
+        log "No Moom.plist found — skipping Moom import"
+        return 0
+    fi
+
+    if pgrep -xq "Moom" 2>/dev/null; then
+        warn "Moom is running — quit Moom before pull for settings to take effect"
+    fi
+
+    step "Importing Moom preferences: $input_file"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY-RUN: Would import Moom preferences from $input_file"
+        return 0
+    fi
+
+    defaults import com.manytricks.Moom "$input_file"
+
+    ok "Moom preferences imported — launch Moom to apply"
 }
 
 # ----
@@ -1976,6 +2065,7 @@ update_from_remote_before_push
 check_for_unrestored_remote_changes
 generate_brewfile
 generate_installed_apps_list
+export_moom_preferences
 collect_local_files
 prune_unmanaged_repository_paths
 prune_unmanaged_machine_paths
@@ -2205,6 +2295,12 @@ if [[ -d "$HOME/.ssh" ]]; then
         -type f \
         -exec chmod 600 {} +
 fi
+
+# Import Moom window-manager preferences from the restored plist.
+# This must run after the machine-specific files have been restored so
+# that ~/Moom.plist is in place. Skipped if the file was not present in
+# the repository for this machine.
+restore_moom_preferences
 
 prune_local_backups
 

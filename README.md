@@ -29,6 +29,7 @@ Stored beneath `machines/<machine-name>/home` and restored only on the machine w
 
 - `~/Brewfile`
 - `~/installed-apps.txt`
+- `~/Moom.plist`
 
 Caches, logs and known credential files (for example `hosts.yml`, `rclone.conf`, `*.token`, `*.key`) are excluded from directory syncs via `EXCLUDE_PATTERNS` in `macos-config-sync.sh`.
 
@@ -52,3 +53,9 @@ brew bundle --file="$HOME/Brewfile"
 - Creates `~/.ssh/sockets/` (mode 700) if it does not already exist. The `ControlPath` directive in `~/.ssh/config` points to this directory — without it, SSH silently falls back to opening a new connection for every git command, which is slower and prone to intermittent timeouts.
 
 The sockets directory is not tracked in Git (it only holds transient Unix domain sockets created by SSH at runtime). It is created automatically by `pull`, `restore`, and `bootstrap.sh`.
+
+## Moom
+
+[Moom](https://manytricks.com/moom/) window-layout preferences are exported on every push and imported on every pull/restore, using \`defaults export\` / \`defaults import\` as [recommended by the developer](https://manytricks.com/osticket/kb/faq.php?id=53). The exported \`Moom.plist\` is machine-specific (\`machines/<machine-name>/home/Moom.plist\`) because window layouts are typically tied to a machine's display configuration.
+
+**Important:** Quit Moom before running push or pull. While Moom is running it holds preferences in memory, so an export may read stale data and an import may be overwritten when Moom next saves. The script warns if a running Moom process is detected but does not abort — machines without Moom installed simply skip the export/import step.
