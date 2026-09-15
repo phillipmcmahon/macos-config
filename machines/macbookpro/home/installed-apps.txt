@@ -12,6 +12,8 @@ ForkLift
 Google Chrome
 HandBrake
 Hazel
+Install macOS 27 Golden Gate
+Install macOS Sequoia
 IPTVnator
 Jellyfin Desktop
 Loopback
