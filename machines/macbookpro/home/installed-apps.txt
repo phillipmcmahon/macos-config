@@ -2,20 +2,15 @@ Adguard
 AdGuard VPN
 Arq
 Audio Hijack
-Better Dock
 Bitwarden
 Citrix Workspace
 Emby
-Feishin
 Firefox
 ForkLift
 Google Chrome
 HandBrake
 Hazel
-Install macOS 27 Golden Gate
-Install macOS Sequoia
 IPTVnator
-Jellyfin Desktop
 Loopback
 Microsoft 365 Copilot Shim
 Microsoft Defender Shim
@@ -29,21 +24,16 @@ Mimestream
 Moom
 Mp3tag
 Mullvad VPN
-NaviBeat
 OneDrive
 OpenLogi
-Passepartout
 Plex
-Pure Paste
 Safari
 SMBMounter
 SoundSource
 Spotify
-Supersonic
+Steam
 Tailscale
-Task Manager TMOG
 UniFi Endpoint
 VLC
-WaveRace64Recomp
 ZoomVDI
 ZoomVDIUninstaller
