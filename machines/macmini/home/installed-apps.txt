@@ -1,3 +1,4 @@
+.Dolphin Updater.2
 Adguard
 AdGuard VPN
 AltTab
