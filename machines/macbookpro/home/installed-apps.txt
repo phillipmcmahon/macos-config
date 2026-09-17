@@ -1,9 +1,11 @@
 Adguard
 AdGuard VPN
+Amphetamine
 Arq
 Audio Hijack
 Bitwarden
 Citrix Workspace
+Cyberduck
 Dolphin
 Emby
 Firefox
@@ -11,7 +13,11 @@ ForkLift
 Google Chrome
 HandBrake
 Hazel
+Infuse
 IPTVnator
+Jabra Direct
+Jabra Firmware Update
+KeyboardCleanTool
 Loopback
 Microsoft 365 Copilot Shim
 Microsoft Defender Shim
@@ -25,9 +31,12 @@ Mimestream
 Moom
 Mp3tag
 Mullvad VPN
+NaviBeat
 OneDrive
 OpenLogi
+Passepartout
 Plex
+Pure Paste
 Safari
 SMBMounter
 SoundSource
@@ -35,6 +44,7 @@ Spotify
 Steam
 Tailscale
 Task Manager TMOG
+Transmit
 UniFi Endpoint
 VLC
 ZoomVDI

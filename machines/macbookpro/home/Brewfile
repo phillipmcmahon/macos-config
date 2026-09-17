@@ -54,6 +54,8 @@ cask "audio-hijack"
 cask "bitwarden"
 # Managed desktop virtualization solution
 cask "citrix-workspace"
+# Server and cloud storage browser
+cask "cyberduck"
 # Emulator to play GameCube and Wii games
 cask "dolphin@dev"
 # Client for emby media server
@@ -70,6 +72,8 @@ cask "handbrake-app"
 cask "hazel"
 # Open Source m3u, m3u8 player
 cask "iptvnator"
+# Blocks all Keyboard and TouchBar input
+cask "keyboardcleantool"
 # Cable-free audio router
 cask "loopback"
 # Office suite
@@ -92,6 +96,8 @@ cask "soundsource"
 cask "spotify"
 # Mesh VPN based on WireGuard
 cask "tailscale-app"
+# File transfer application
+cask "transmit"
 # License free Wi-Fi, VPN, and Access Application for Organizations
 cask "unifi-identity-endpoint"
 # Multimedia player
