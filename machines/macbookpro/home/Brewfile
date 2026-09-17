@@ -54,6 +54,8 @@ cask "audio-hijack"
 cask "bitwarden"
 # Managed desktop virtualization solution
 cask "citrix-workspace"
+# Emulator to play GameCube and Wii games
+cask "dolphin@dev"
 # Client for emby media server
 cask "emby"
 # Web browser

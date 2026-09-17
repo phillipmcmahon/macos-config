@@ -4,6 +4,7 @@ Arq
 Audio Hijack
 Bitwarden
 Citrix Workspace
+Dolphin
 Emby
 Firefox
 ForkLift
@@ -33,6 +34,7 @@ SoundSource
 Spotify
 Steam
 Tailscale
+Task Manager TMOG
 UniFi Endpoint
 VLC
 ZoomVDI
