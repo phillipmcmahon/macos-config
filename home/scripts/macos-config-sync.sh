@@ -2,7 +2,31 @@
 #
 # macos-config-sync.sh
 #
-# Version: 2.8.0
+# Version: 3.0.0
+#
+# v3.0.0:
+#   - New: 'sync' is the normal multi-machine workflow. It snapshots HOME
+#     against the current local Git base before fetching, commits that local
+#     snapshot, then rebases it onto origin. Git therefore performs the real
+#     three-way reconciliation of BASE, LOCAL and REMOTE states.
+#   - New files below managed directories are captured as local additions
+#     before any fetch. A remote update can no longer make rsync delete an
+#     uncommitted local file merely because it is absent from GitHub.
+#   - Modify/modify, modify/delete, delete/modify and add/add conflicts are
+#     left in the local Git repository for normal Git conflict resolution.
+#     HOME is not changed unless reconciliation completes successfully.
+#   - Deletions are displayed and require confirmation. Unattended runs must
+#     set ACCEPT_DELETIONS=1. Rejected deletions are not committed or deployed.
+#   - Successful sync deployment is non-destructive for managed directories:
+#     repository files are copied into HOME without rsync --delete. Only paths
+#     Git proves were deleted relative to the sync base are removed, so local
+#     untracked files are preserved.
+#   - Git filesystem-mode tracking is disabled for this repository because the
+#     restore step deliberately makes managed *.sh files executable. This
+#     prevents that local permission enforcement from becoming a false edit.
+#   - 'push' is retained as a compatibility alias for 'sync'. 'pull' and
+#     'restore' retain deliberate repository-to-Mac mirror semantics for
+#     bootstrap and recovery.
 #
 # v2.8.0:
 #   - New: Moom window-manager preferences (com.manytricks.Moom) are now
@@ -369,8 +393,9 @@
 #
 # Commands:
 #   init        Clone or initialise the local repository
-#   push        Copy local files into the repository and push to GitHub
-#   pull        Pull from GitHub and restore files to their normal locations
+#   sync        Reconcile local and remote changes, then update both sides
+#   push        Compatibility alias for sync
+#   pull        Force GitHub state onto the Mac (destructive restore)
 #   restore     Restore files from the local repository without contacting
 #               the remote (used by bootstrap.sh before SSH keys exist)
 #   status      Show local, GitHub and NAS status
@@ -380,18 +405,16 @@
 #   help        Display usage information
 #
 # Important:
-#   push treats the Mac as the source of truth.
-#   pull treats GitHub as the source of truth.
-#
-#   If a managed file is deleted locally and push is run, that deletion is
-#   committed to Git. Run pull before push to recover an accidental deletion.
+#   sync performs three-way reconciliation and is the normal command.
+#   pull and restore are deliberate mirror operations and may remove local
+#   files from managed directories after first creating a backup.
 #
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="2.8.0"
+readonly SCRIPT_VERSION="3.0.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -433,6 +456,10 @@ BACKUP_RETENTION="${BACKUP_RETENTION:-10}"
 LOCK_DIR="${LOCK_DIR:-$HOME/.local/state/macos-config/run.lock}"
 
 DRY_RUN="${DRY_RUN:-0}"
+
+# Deletions are never propagated silently by sync. Interactive runs prompt;
+# unattended runs must opt in explicitly with ACCEPT_DELETIONS=1.
+ACCEPT_DELETIONS="${ACCEPT_DELETIONS:-0}"
 
 # When set to 1, the staleness guard (check_for_unrestored_remote_changes)
 # is bypassed — the push proceeds even when the remote contains changes
@@ -497,8 +524,9 @@ MACHINE_FILES=(
     "Moom.plist"
 )
 
-# Patterns excluded from every managed directory sync.
-# Also used to generate the repository .gitignore (see create_repository_files).
+# Local-only patterns excluded from every managed directory sync. Add private,
+# experimental or machine-local filenames here when they live below a shared
+# directory but must never enter Git. These patterns also generate .gitignore.
 EXCLUDE_PATTERNS=(
     '.DS_Store'
     '*.swp'
@@ -744,9 +772,10 @@ Usage:
 
 Commands:
   init        Clone or initialise the local repository
-  push        Copy local configuration into Git and push to GitHub
-  pull        Pull from GitHub and restore configuration to the Mac
-  restore     Restore files from the local repository (no remote contact)
+  sync        Reconcile the Mac and GitHub, then update both safely
+  push        Compatibility alias for sync
+  pull        Force GitHub state onto the Mac (destructive mirror)
+  restore     Force local repository state onto the Mac (destructive mirror)
   status      Show local repository, GitHub and NAS status
   nas-push    Mirror the local repository to the NAS
   nas-pull    Restore the local repository from the NAS
@@ -792,8 +821,16 @@ Environment overrides:
   MACHINE_NAME      Override the auto-detected machine name (default:
                     scutil --get LocalHostName, fallback: hostname -s)
   DRY_RUN=1         Log commands without executing them
+  ACCEPT_DELETIONS=1
+                    Allow sync to propagate displayed deletions without an
+                    interactive confirmation (required for unattended runs)
   FORCE_PUSH=1      Skip the staleness guard and push even when the
-                    remote has unrestored changes
+                    remote has unrestored changes (legacy workflow only)
+
+Normal use:
+  Run '$SCRIPT_NAME sync' on each Mac. The script snapshots local changes
+  before fetching, lets Git reconcile them with GitHub, and changes HOME only
+  after reconciliation succeeds. Pull and restore are recovery commands.
 EOF
 }
 
@@ -821,6 +858,8 @@ validate_dependencies() {
     require_command paste
     require_command cut
     require_command tr
+    require_command comm
+    require_command mktemp
 }
 
 validate_managed_path() {
@@ -850,6 +889,9 @@ validate_configuration() {
 
     [[ "$DRY_RUN" == "0" || "$DRY_RUN" == "1" ]] ||
         die "DRY_RUN must be either 0 or 1."
+
+    [[ "$ACCEPT_DELETIONS" == "0" || "$ACCEPT_DELETIONS" == "1" ]] ||
+        die "ACCEPT_DELETIONS must be either 0 or 1."
 
     [[ "$FORCE_PUSH" == "0" || "$FORCE_PUSH" == "1" ]] ||
         die "FORCE_PUSH must be either 0 or 1."
@@ -978,6 +1020,13 @@ repository_has_commits() {
 
 repository_is_clean() {
     [[ -z "$(git -C "$REPO_DIR" status --porcelain)" ]]
+}
+
+configure_repository_for_sync() {
+    # Deployment deliberately makes every managed shell script executable.
+    # Ignore filesystem mode drift in Git so that this local enforcement does
+    # not become a false content edit or a modify/delete conflict later.
+    run git -C "$REPO_DIR" config core.fileMode false
 }
 
 remote_branch_exists() {
@@ -1346,11 +1395,11 @@ EOF
         fi
         cat <<'EOF'
 
-Caches, logs and known credential files (for example `hosts.yml`, `rclone.conf`, `*.token`, `*.key`) are excluded from directory syncs via `EXCLUDE_PATTERNS` in `macos-config-sync.sh`.
+Caches, logs and known credential files (for example `hosts.yml`, `rclone.conf`, `*.token`, `*.key`) are excluded from directory syncs via `EXCLUDE_PATTERNS` in `macos-config-sync.sh`. Add any experimental or deliberately local-only filename pattern there so it is neither collected nor removed by routine sync.
 
 ## Restore
 
-Use `macos-config-sync.sh pull` to retrieve the current GitHub version and restore files to their normal locations. Shared files are restored everywhere; machine-specific files are restored only on the matching machine.
+Use `macos-config-sync.sh sync` for normal multi-machine operation. It captures local changes before fetching, reconciles them with GitHub using Git, and deploys only after conflicts are resolved. Use `pull` only when you deliberately want GitHub to replace the managed local state. Shared files are restored everywhere; machine-specific files are restored only on the matching machine.
 
 ## Homebrew
 
@@ -1394,6 +1443,7 @@ if repository_exists; then
     log "Repository is already initialised: $REPO_DIR"
     ensure_repository_structure
     create_repository_files
+    configure_repository_for_sync
     return 0
 fi
 
@@ -1426,6 +1476,7 @@ fi
 
 ensure_repository_structure
 create_repository_files
+configure_repository_for_sync
 
 ok "Repository initialised: $REPO_DIR"
 }
@@ -2056,24 +2107,438 @@ check_for_unrestored_remote_changes() {
     ok "Staleness guard passed — local files are up to date with remote changes"
 }
 
-push_configuration() {
-validate_dependencies
-validate_configuration
-require_repository
-show_tool_versions
+# ----
+# Three-way multi-machine synchronisation
+# ----
 
-update_from_remote_before_push
-check_for_unrestored_remote_changes
-generate_brewfile
-generate_installed_apps_list
-export_moom_preferences
-collect_local_files
-prune_unmanaged_repository_paths
-prune_unmanaged_machine_paths
-create_repository_files
-scan_for_secrets
-commit_and_push
-mirror_repository_to_nas
+repository_path_to_home_path() {
+    local repo_path="$1"
+    local home_relative=""
+
+    ensure_machine_name
+
+    case "$repo_path" in
+        home/*)
+            home_relative="${repo_path#home/}"
+            is_managed_repository_path "$home_relative" || return 1
+            ;;
+        machines/"$MACHINE"/home/*)
+            home_relative="${repo_path#machines/"$MACHINE"/home/}"
+            is_machine_repository_path "$home_relative" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$home_relative"
+}
+
+list_managed_deletions() {
+    local comparison="$1"
+    shift
+
+    local repo_path
+    local home_relative
+
+    if [[ "$comparison" == "cached" ]]; then
+        while IFS= read -r -d '' repo_path; do
+            home_relative="$(repository_path_to_home_path "$repo_path")" || continue
+            printf '%s\n' "$home_relative"
+        done < <(git -C "$REPO_DIR" diff --cached --diff-filter=D --name-only -z --)
+    else
+        while IFS= read -r -d '' repo_path; do
+            home_relative="$(repository_path_to_home_path "$repo_path")" || continue
+            printf '%s\n' "$home_relative"
+        done < <(git -C "$REPO_DIR" diff --diff-filter=D --name-only -z "$@" --)
+    fi
+}
+
+confirm_deletions() {
+    local deletion_file="$1"
+    local description="$2"
+    local sorted_file="${deletion_file}.sorted"
+    local answer=""
+    local count
+
+    LC_ALL=C sort -u "$deletion_file" >"$sorted_file"
+    mv "$sorted_file" "$deletion_file"
+
+    [[ -s "$deletion_file" ]] || return 0
+
+    count="$(wc -l <"$deletion_file" | tr -d ' ')"
+    printf '\n%s%s (%s):%s\n' "$C_YELLOW" "$description" "$count" "$C_RESET" >&2
+    while IFS= read -r home_relative; do
+        printf '  - ~/%s\n' "$home_relative" >&2
+    done <"$deletion_file"
+    printf '\n' >&2
+
+    if [[ "$ACCEPT_DELETIONS" == "1" ]]; then
+        warn "ACCEPT_DELETIONS=1 set — allowing the displayed deletions"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        warn "DRY-RUN: Deletions would require confirmation"
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        warn "Deletion confirmation requires a terminal. Re-run with ACCEPT_DELETIONS=1 after reviewing the list."
+        return 1
+    fi
+
+    printf 'Continue with these deletions? [y/N] ' >&2
+    IFS= read -r answer
+
+    case "$answer" in
+        y | Y | yes | YES | Yes)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+reset_uncommitted_snapshot() {
+    local base_commit="$1"
+
+    [[ "$DRY_RUN" == "1" ]] && return 0
+
+    if [[ -n "$base_commit" ]]; then
+        git -C "$REPO_DIR" reset --hard "$base_commit" >/dev/null
+    else
+        git -C "$REPO_DIR" reset --hard >/dev/null 2>&1 || true
+    fi
+
+    git -C "$REPO_DIR" clean -fd >/dev/null
+}
+
+commit_local_snapshot() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        git -C "$REPO_DIR" status --short
+        return 0
+    fi
+
+    if git -C "$REPO_DIR" diff --cached --quiet; then
+        log "No local configuration changes to commit"
+        return 0
+    fi
+
+    local computer_name
+    local timestamp
+
+    computer_name="$(scutil --get ComputerName 2>/dev/null || hostname)"
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S %z')"
+
+    git -C "$REPO_DIR" commit \
+        -m "Update configuration from ${computer_name} at ${timestamp}"
+
+    ok "Local configuration snapshot committed"
+}
+
+sync_directory_without_delete() {
+    local source_dir="$1"
+    local destination_dir="$2"
+    shift 2
+
+    [[ -d "$source_dir" ]] || return 0
+
+    run mkdir -p "$destination_dir"
+    run rsync \
+        "${COMMON_RSYNC_OPTIONS[@]}" \
+        "$@" \
+        "$source_dir/" \
+        "$destination_dir/"
+}
+
+apply_reconciled_deletions() {
+    local base_commit="$1"
+    local repo_path
+    local home_relative
+    local destination
+
+    [[ -n "$base_commit" ]] || return 0
+
+    while IFS= read -r -d '' repo_path; do
+        home_relative="$(repository_path_to_home_path "$repo_path")" || continue
+        destination="$(local_path "$home_relative")"
+
+        reject_symlink_components "$HOME" "$home_relative" "~/$home_relative"
+
+        if [[ -d "$destination" ]]; then
+            die "Refusing to remove a directory for a Git file deletion: $destination"
+        fi
+
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            log "Removing reconciled deletion: ~/$home_relative"
+            run rm -f "$destination"
+        fi
+    done < <(git -C "$REPO_DIR" diff --diff-filter=D --name-only -z "$base_commit" HEAD --)
+}
+
+apply_local_permissions() {
+    if [[ -d "$HOME/scripts" ]]; then
+        run find "$HOME/scripts" -type f -name '*.sh' -exec chmod u+x {} +
+    fi
+
+    if [[ -d "$HOME/.gnupg" ]]; then
+        run chmod 700 "$HOME/.gnupg"
+        run find "$HOME/.gnupg" -type f -exec chmod 600 {} +
+    fi
+
+    if [[ -d "$HOME/.ssh" ]]; then
+        run chmod 700 "$HOME/.ssh"
+        run mkdir -p "$HOME/.ssh/sockets"
+        run chmod 700 "$HOME/.ssh/sockets"
+        run find "$HOME/.ssh" -type f -exec chmod 600 {} +
+    fi
+}
+
+deploy_reconciled_files() {
+    local base_commit="$1"
+    local path
+
+    step "Applying reconciled configuration to the Mac"
+
+    for path in "${MANAGED_DIRECTORIES[@]}"; do
+        reject_symlink_components "$HOME" "$path" "~/$path"
+        reject_symlink_components "$REPO_DIR" "home/$path" "repo:home/$path"
+        reject_symlinks_in_directory "$(repository_path "$path")" "repo:home/$path"
+    done
+
+    for path in "${MANAGED_FILES[@]}"; do
+        reject_symlink_components "$HOME" "$path" "~/$path"
+        reject_symlink_components "$REPO_DIR" "home/$path" "repo:home/$path"
+    done
+
+    for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
+        reject_symlink_components "$HOME" "$path" "~/$path"
+        reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo:machines/$MACHINE/home/$path"
+        reject_symlinks_in_directory "$(machine_repository_path "$path")" "repo:machines/$MACHINE/home/$path"
+    done
+
+    for path in "${MACHINE_FILES[@]}"; do
+        reject_symlink_components "$HOME" "$path" "~/$path"
+        reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo:machines/$MACHINE/home/$path"
+    done
+
+    create_local_backup
+
+    for path in "${MANAGED_DIRECTORIES[@]}"; do
+        log "Updating ~/$path without deleting local untracked files"
+        sync_directory_without_delete \
+            "$(repository_path "$path")" \
+            "$(local_path "$path")" \
+            "${DIRECTORY_EXCLUDES[@]}" \
+            --exclude='.git/'
+    done
+
+    for path in "${MANAGED_FILES[@]}"; do
+        if [[ -f "$(repository_path "$path")" ]]; then
+            log "Updating ~/$path"
+            sync_file "$(repository_path "$path")" "$(local_path "$path")"
+        fi
+    done
+
+    for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
+        if [[ -d "$(machine_repository_path "$path")" ]]; then
+            log "Updating ~/$path without deleting local untracked files (machine: $MACHINE)"
+            sync_directory_without_delete \
+                "$(machine_repository_path "$path")" \
+                "$(local_path "$path")" \
+                "${DIRECTORY_EXCLUDES[@]}" \
+                --exclude='.git/'
+        fi
+    done
+
+    for path in "${MACHINE_FILES[@]}"; do
+        if [[ -f "$(machine_repository_path "$path")" ]]; then
+            log "Updating ~/$path (machine: $MACHINE)"
+            sync_file "$(machine_repository_path "$path")" "$(local_path "$path")"
+        fi
+    done
+
+    apply_reconciled_deletions "$base_commit"
+    apply_local_permissions
+    restore_moom_preferences
+    prune_local_backups
+
+    ok "Reconciled configuration applied"
+}
+
+show_rebase_conflicts() {
+    local repo_path
+    local home_relative
+
+    printf '\n%sConflicts require manual resolution:%s\n' "$C_RED" "$C_RESET" >&2
+    while IFS= read -r repo_path; do
+        [[ -n "$repo_path" ]] || continue
+        if home_relative="$(repository_path_to_home_path "$repo_path")"; then
+            printf '  ~/%s\n' "$home_relative" >&2
+        else
+            printf '  %s\n' "$repo_path" >&2
+        fi
+    done < <(git -C "$REPO_DIR" diff --name-only --diff-filter=U)
+
+    cat >&2 <<EOF
+
+HOME has not been changed.
+
+Resolve the files in:
+  $REPO_DIR
+
+Then run:
+  git -C "$REPO_DIR" add <resolved-files>
+  git -C "$REPO_DIR" rebase --continue
+  $SCRIPT_NAME sync
+
+To abandon the reconciliation:
+  git -C "$REPO_DIR" rebase --abort
+  rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
+  rm -f "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
+EOF
+}
+
+finish_reconciled_sync() {
+    local base_commit="$1"
+    local temp_dir="$2"
+    local final_deletions="$temp_dir/final-deletions"
+    local pending_deletions="$temp_dir/pending-deletions"
+    local accepted_deletions="$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
+
+    : >"$final_deletions"
+    [[ -n "$base_commit" ]] &&
+        list_managed_deletions range "$base_commit" HEAD >"$final_deletions"
+
+    LC_ALL=C sort -u "$final_deletions" -o "$final_deletions"
+    if [[ -s "$accepted_deletions" ]]; then
+        LC_ALL=C sort -u "$accepted_deletions" -o "$accepted_deletions"
+        comm -23 "$final_deletions" "$accepted_deletions" >"$pending_deletions"
+    else
+        cp "$final_deletions" "$pending_deletions"
+    fi
+
+    if ! confirm_deletions "$pending_deletions" "Additional deletions in the reconciled result"; then
+        die "Sync stopped. No reconciled files were applied to HOME or pushed."
+    fi
+
+    commit_and_push
+    deploy_reconciled_files "$base_commit"
+    run rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
+    run rm -f "$accepted_deletions"
+    mirror_repository_to_nas
+
+    ok "Synchronisation complete"
+}
+
+resume_reconciled_sync() {
+    local pending_file="$REPO_DIR/.git/macos-config-sync-pending-base"
+    local base_commit
+    local temp_dir="$1"
+
+    [[ -f "$pending_file" ]] || return 1
+
+    if ! repository_is_clean; then
+        warn "A previous sync is waiting for Git conflict resolution."
+        show_rebase_conflicts
+        exit 1
+    fi
+
+    base_commit="$(sed -n '1p' "$pending_file")"
+    [[ -n "$base_commit" ]] || die "Pending sync marker is invalid: $pending_file"
+    git -C "$REPO_DIR" cat-file -e "${base_commit}^{commit}" 2>/dev/null ||
+        die "Pending sync base commit is unavailable: $base_commit"
+
+    step "Resuming the previously reconciled sync"
+
+    if remote_branch_exists; then
+        run git -C "$REPO_DIR" fetch origin "$GIT_BRANCH"
+        if [[ "$DRY_RUN" != "1" ]] &&
+           ! git -C "$REPO_DIR" merge-base --is-ancestor "origin/$GIT_BRANCH" HEAD; then
+            if ! git -C "$REPO_DIR" rebase "origin/$GIT_BRANCH"; then
+                show_rebase_conflicts
+                exit 1
+            fi
+        fi
+    fi
+
+    finish_reconciled_sync "$base_commit" "$temp_dir"
+    return 0
+}
+
+sync_configuration() {
+    validate_dependencies
+    validate_configuration
+    require_repository
+    show_tool_versions
+    configure_repository_for_sync
+
+    local temp_dir
+    temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/macos-config-sync.XXXXXX")"
+
+    if resume_reconciled_sync "$temp_dir"; then
+        rm -rf "$temp_dir"
+        return 0
+    fi
+
+    repository_is_clean ||
+        die "The local repository contains uncommitted changes. Inspect $REPO_DIR before syncing."
+
+    local base_commit=""
+    if repository_has_commits; then
+        base_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    fi
+
+    step "Capturing local configuration before contacting GitHub"
+    generate_brewfile
+    generate_installed_apps_list
+    export_moom_preferences
+    collect_local_files
+    prune_unmanaged_repository_paths
+    prune_unmanaged_machine_paths
+    create_repository_files
+    scan_for_secrets
+
+    local local_deletions="$temp_dir/local-deletions"
+    list_managed_deletions cached >"$local_deletions"
+    if ! confirm_deletions "$local_deletions" "Local deletions to propagate"; then
+        reset_uncommitted_snapshot "$base_commit"
+        rm -rf "$temp_dir"
+        die "Sync cancelled. The repository was restored and HOME was not changed."
+    fi
+
+    commit_local_snapshot
+
+    if [[ "$DRY_RUN" != "1" && -n "$base_commit" ]]; then
+        cp "$local_deletions" "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
+        printf '%s\n' "$base_commit" >"$REPO_DIR/.git/macos-config-sync-pending-base"
+    fi
+
+    if remote_branch_exists; then
+        step "Fetching current remote branch"
+        run git -C "$REPO_DIR" fetch origin "$GIT_BRANCH"
+
+        if [[ "$DRY_RUN" != "1" ]]; then
+            step "Reconciling local and remote commits"
+            if ! git -C "$REPO_DIR" rebase "origin/$GIT_BRANCH"; then
+                rm -rf "$temp_dir"
+                show_rebase_conflicts
+                exit 1
+            fi
+        fi
+    else
+        log "Remote branch does not yet exist: $GIT_BRANCH"
+    fi
+
+    finish_reconciled_sync "$base_commit" "$temp_dir"
+    rm -rf "$temp_dir"
+}
+
+push_configuration() {
+    warn "The push command is now an alias for sync. Use '$SCRIPT_NAME sync' for normal operation."
+    sync_configuration
 }
 
 # ----
@@ -2328,6 +2793,8 @@ run git -C "$REPO_DIR" checkout "$GIT_BRANCH"
 run git -C "$REPO_DIR" pull --ff-only origin "$GIT_BRANCH"
 
 restore_local_files
+run rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
+run rm -f "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
 mirror_repository_to_nas
 }
 
@@ -2349,6 +2816,8 @@ show_tool_versions
 
 step "Restoring configuration from local repository (no remote contact)"
 restore_local_files
+run rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
+run rm -f "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
 }
 
 # ----
@@ -2598,7 +3067,7 @@ local command="${1:-help}"
 local requires_lock=0
 
 case "$command" in
-    init | push | pull | restore | nas-push | nas-pull)
+    init | sync | push | pull | restore | nas-push | nas-pull)
         requires_lock=1
         ;;
 esac
@@ -2611,6 +3080,9 @@ fi
 case "$command" in
     init)
         initialise_repository
+        ;;
+    sync)
+        sync_configuration
         ;;
     push)
         push_configuration

@@ -32,11 +32,11 @@ Stored beneath `machines/<machine-name>/home` and restored only on the machine w
 - `~/installed-apps.txt`
 - `~/Moom.plist`
 
-Caches, logs and known credential files (for example `hosts.yml`, `rclone.conf`, `*.token`, `*.key`) are excluded from directory syncs via `EXCLUDE_PATTERNS` in `macos-config-sync.sh`.
+Caches, logs and known credential files (for example `hosts.yml`, `rclone.conf`, `*.token`, `*.key`) are excluded from directory syncs via `EXCLUDE_PATTERNS` in `macos-config-sync.sh`. Add any experimental or deliberately local-only filename pattern there so it is neither collected nor removed by routine sync.
 
 ## Restore
 
-Use `macos-config-sync.sh pull` to retrieve the current GitHub version and restore files to their normal locations. Shared files are restored everywhere; machine-specific files are restored only on the matching machine.
+Use `macos-config-sync.sh sync` for normal multi-machine operation. It captures local changes before fetching, reconciles them with GitHub using Git, and deploys only after conflicts are resolved. Use `pull` only when you deliberately want GitHub to replace the managed local state. Shared files are restored everywhere; machine-specific files are restored only on the matching machine.
 
 ## Homebrew
 
