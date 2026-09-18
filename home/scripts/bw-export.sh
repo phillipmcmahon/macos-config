@@ -1,137 +1,59 @@
 #!/usr/bin/env bash
 #
-# bw-export.sh — Bitwarden vault + attachment backup
-# Version: 1.4.0
+# bw-export.sh - Bitwarden personal + organisation vault backup
+# Version: 1.5.0
 #
-# Exports the full Bitwarden vault (JSON) and all item attachments,
-# zips them, encrypts the archive with a GPG public key (private key
-# held on a YubiKey), verifies decryptability, and copies the result
-# to a NAS if mounted.
+# Exports personal JSON plus a separate JSON for EVERY organisation returned
+# by bw list organizations. An inaccessible organisation aborts the backup:
+# no silent omissions. Export permissions are required for each organisation.
+# Downloads attachments for every exported item, including organisation items
+# fetched individually when absent from bw list items. Any access failure aborts.
+# Trash and Sends are excluded by Bitwarden exports. This is a vault-content
+# backup, not a complete server/account/configuration backup.
 #
-# Plaintext is staged under $TMPDIR (not ~/Documents) to reduce the chance
-# of iCloud/backup capture.
+# Validates JSON, reconciles visible item IDs against exported IDs, records
+# attachment names, parent IDs, sizes and SHA-256 hashes in manifest.json,
+# tests the ZIP, and encrypts it to the configured GPG recipient.
+# A successful decrypt test means DECRYPTION VERIFIED, not restore-tested.
+# An actual test import and attachment restoration remain a separate exercise.
+# See RECOVERY.txt inside each new archive for layout and restore guidance.
 #
-# Decrypt verification needs the YubiKey + PIN, so it only runs in an
-# interactive session. Unattended runs (cron/launchd) ARE allowed to become
-# the current backup — an unverified backup beats none — but are named
-# bw-auto-export-<ts>-unverified.zip.gpg so they are never mistaken for a
-# recovery-tested one. Run './bw-export.sh --verify' later (with the
-# YubiKey present): it decrypt-tests every '-unverified' export and renames
-# BOTH the local copy and its NAS copy (after confirming they are identical).
-# If the NAS is not mounted at that time, the NAS copy keeps its
-# '-unverified' name; a later '--verify' with the NAS mounted reconciles it
-# in a second pass (hash-matched against the verified local copy, or
-# decrypt-tested directly if no local copy remains). Both passes cover the
-# current directory and archive/.
+# Plaintext uses a private directory under TMPDIR and is removed before PIN
+# entry or replication. Overwriting cannot guarantee erasure on APFS/SSDs.
+# FileVault protects data at rest. Hard kills/power loss can leave staging.
 #
-# v1.4.0:
-#   - Interactive runs without the YubiKey no longer hard-fail. Before the
-#     decrypt test the script checks (gpg --card-status) whether a card
-#     holding the encryption key is present. If not, the export is
-#     installed and replicated under the '-unverified' name, exactly as in
-#     an unattended run, and a warning points to '--verify'. A decrypt
-#     failure WITH the key present is still a hard failure (the file is
-#     kept as DECRYPT-FAILED-* for inspection).
-#   - '--verify' resolves the encryption key and checks for the YubiKey up
-#     front, aborting with a clear message instead of failing per file.
-#
-# v1.3.9:
-#   - Guard against TMPDIR=/ edge case: trailing-slash strip is skipped
-#     when TMPDIR is exactly '/' to avoid producing an empty string.
-#
-# v1.3.8:
-#   - Only items that actually have attachments get a directory in the
-#     archive. Previously 'select(.attachments != null)' also matched the
-#     empty array '[]' that the CLI reports for most items, producing one
-#     empty directory per vault item (and a 700+ line 'zip' listing).
-#   - Trailing slash stripped from $TMPDIR (macOS sets one), avoiding
-#     '//' in staged paths.
-#
-# v1.3.7:
-#   - Both local and NAS installation refuse to proceed if a file with the
-#     target name already exists, preventing silent overwrites.
-#
-# v1.3.6:
-#   - Lock is released as the very last step of cleanup(), after the
-#     plaintext staging directory has been wiped.
-#   - --verify captures the '-unverified' file list up front so a failing
-#     'find' aborts the run instead of silently yielding an empty list.
-#   - Rotation into archive/ never overwrites: an existing identically
-#     named archive file aborts before anything is moved.
-#
-# v1.3.5:
-#   - Lock is never removed automatically (the check-PID/rm/mkdir sequence
-#     was racy); a held lock aborts with instructions for manual removal.
-#   - --verify scans current dir AND archive/, both locally and on the NAS,
-#     renaming files in place.
-#   - Mode is parsed first; --verify only requires gpg + a SHA-256 tool and
-#     skips encryption-key resolution.
-#
-# v1.3.4:
-#   - --verify has a second reconciliation pass over NAS '-unverified'
-#     files, so a NAS copy that was offline during an earlier --verify
-#     can still be reconciled (matched against a verified local copy, or
-#     decrypt-tested directly if no local copy remains).
-#   - Concurrency lock (mkdir-based, stale-PID aware): two exports, or an
-#     export and a --verify, cannot run at the same time.
-#   - INT/TERM traps now just exit; cleanup runs once from the EXIT trap.
-#   - Wording: local/NAS rename happens "after all checks", not atomically.
-#
-# v1.3.3:
-#   - --verify performs ALL checks (decrypt test, NAS hash, no existing
-#     target names) before renaming anything; local and NAS copies are then
-#     renamed together. Never overwrites an existing verified file.
-#   - Rotation comment clarified: an unattended run deliberately makes its
-#     '-unverified' export current and rotates the previous one.
-#
-# v1.3.2:
-#   - GPG encryption subkey is chosen by explicit creation timestamp
-#     (field 6), not by listing order.
-#   - New '--verify' mode: decrypt-tests '-unverified' exports and renames
-#     the local and NAS copies together.
-#
-# v1.3.1:
-#   - Unverified (non-interactive) exports are installed/replicated under a
-#     distinct '-unverified' name; a failed decrypt test is kept as
-#     DECRYPT-FAILED-*.zip.gpg outside the rotation glob.
-#   - Rotation globs narrowed to bw-auto-export-*.zip.gpg.
-#   - Simpler GPG encryption-subkey selection (still --with-colons).
-#   - 'df -P' called without '--' for macOS df compatibility.
-#   - mktemp template restored to ten X's.
-#
-# v1.3.0:
-#   - Only 'bw lock' if this script performed the unlock; pre-existing
-#     unlocked state is left as found. BW_SESSION is unset once the last
-#     Bitwarden operation has completed.
-#   - Rotation of the previous local (and NAS) export into archive/ is
-#     deferred until the new export has been encrypted (and, when
-#     interactive, decrypt-tested), so a failed run never removes the
-#     previous backup.
-#   - ZIP archive is integrity-tested (unzip -t) before encryption.
-#   - Plaintext ZIP is securely deleted immediately after encryption.
-#   - "Decryption test passed" is only printed when a decrypt actually ran.
-#   - NAS mount point is validated (not just the directory path) and the
-#     NAS copy is verified via SHA-256 comparison.
-#   - The exact encryption-capable GPG subkey fingerprint is resolved up
-#     front and used explicitly (no key ambiguity / trust prompts).
-#   - Stricter filename sanitisation (control chars / unusual chars).
-#
-# v1.2.0:
-#   - Attachment download loops use process substitution (< <(...)) instead
-#     of pipe-subshell (printf | while) so that individual download failures
-#     propagate to the script and abort the export before encryption
-#   - APFS limitation documented on the cleanup shred/rm -P fallback
-#
-# Requirements: bw (Bitwarden CLI), jq, gpg, zip, unzip,
-#               shasum or sha256sum
 # Usage:
-#   bw-export.sh            run an export (interactive: vault unlock + decrypt test)
-#   bw-export.sh --verify   decrypt-test pending '-unverified' exports and
-#                           rename local + NAS copies (needs YubiKey + TTY)
-# A lock in $downloads_dir prevents concurrent runs of either mode; a lock
-# left by a hard-killed run must be removed manually (the script says how).
+#   bw-export.sh            export (YubiKey optional for encryption)
+#   bw-export.sh --verify   decrypt pending backups using each file's own key
+#
+# Without a TTY or the current encryption card, exports are '-unverified'.
+# --verify lets GPG select the historical key and prompt for the required card.
+# Hash-only NAS reconciliation needs neither a card nor a TTY. Legacy archives
+# remain supported, but are only decryption-verified and have no new manifest.
+# Unattended export requires an already usable BW_SESSION. A locked vault in
+# a non-interactive run fails promptly. Existing unlocked sessions are retained.
+#
+# v1.5.0:
+#   - Check hash command success and digest format before comparison.
+#   - Propagate every rotation move failure, report partial rotation honestly.
+#   - Include organisation exports, validate coverage and attachment inventory.
+#   - Publish local/NAS files only after checked copy to destination staging.
+#     Install locally before rotation. Never deliberately overwrite a target.
+#   - Verify historical files without resolving today's encryption recipient.
+#   - Replace recovery-tested claims with precise decryption verification.
+#     Include encrypted manifest and recovery notes.
+#   - Restrictive umask, early plaintext removal and explicit cleanup failures.
+#
+# Requirements: Bash 3.2+, bw, jq, gpg, zip, unzip, shasum or sha256sum.
+# --verify requires only gpg and a SHA-256 tool (plus standard shell utilities).
+# A local mkdir lock serialises runs on this machine, not other NAS writers.
+# Stale locks require manual inspection/removal. Archives are retained forever.
 #
 set -Eeuo pipefail
+umask 077
+# Save terminal availability before read loops redirect stdin to file lists.
+interactive_session=0
+if [[ -t 0 ]]; then interactive_session=1; fi
 
 # ----
 # Configuration
@@ -185,11 +107,57 @@ secure_rm_file() {
 
 # Print the SHA-256 hex digest of a file (macOS ships shasum; Linux sha256sum).
 sha256_of() {
+  local output digest
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 -- "$1" | awk '{print $1}'
+    output=$(shasum -a 256 -- "$1") || return 1
   else
-    sha256sum -- "$1" | awk '{print $1}'
+    output=$(sha256sum -- "$1") || return 1
   fi
+  digest=${output%% *}
+  [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || {
+    echo "Error: invalid SHA-256 output for $1." >&2
+    return 1
+  }
+  printf '%s\n' "$digest"
+}
+
+# Status 0: equal. Status 1: mismatch OR read/hash failure. Never compare
+# empty/failed command output as though it were a valid digest.
+hashes_match() {
+  local left right
+  left=$(sha256_of "$1") || { echo "Error: cannot hash $1." >&2; return 1; }
+  right=$(sha256_of "$2") || { echo "Error: cannot hash $2." >&2; return 1; }
+  [ "$left" = "$right" ]
+}
+
+# mv -n can return success after skipping an existing target. Check that the
+# source disappeared too. Destination directory is controlled by this script.
+move_no_replace() {
+  [ ! -e "$2" ] && [ ! -L "$2" ] || {
+    echo "Error: destination exists: $2." >&2; return 1;
+  }
+  mv -n -- "$1" "$2" || return 1
+  [ ! -e "$1" ] && [ ! -L "$1" ] || {
+    echo "Error: move did not publish $2 (source remains)." >&2; return 1;
+  }
+}
+
+# Copy into a private directory on the destination filesystem, validate,
+# then rename within that filesystem. A failed copy is never a final backup.
+# pending_dir is cleaned on EXIT. A hard kill may leave a hidden staging dir.
+pending_dir=""
+install_checked() {
+  local source="$1" destination="$2" parent
+  parent=$(dirname "$destination") || return 1
+  [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+  pending_dir=$(mktemp -d "$parent/.bw-export-pending-XXXXXXXXXX") || return 1
+  cp -- "$source" "$pending_dir/export.gpg" || return 1
+  hashes_match "$source" "$pending_dir/export.gpg" || {
+    echo "Error: staged copy failed checksum verification." >&2; return 1;
+  }
+  move_no_replace "$pending_dir/export.gpg" "$destination" || return 1
+  rmdir "$pending_dir" || return 1
+  pending_dir=""
 }
 
 # True if $nas_mount is an actual mount point (not merely a directory left
@@ -216,7 +184,7 @@ rotate_into_archive() {
     [ -n "$f" ] || continue
     name=$(basename "$f")
     [ "$name" != "$keep" ] || continue
-    if [ -e "$dir/archive/$name" ]; then
+    if [ -e "$dir/archive/$name" ] || [ -L "$dir/archive/$name" ]; then
       echo "Error: $dir/archive/$name already exists; refusing to overwrite it during rotation." >&2
       collisions=$((collisions + 1))
     fi
@@ -226,8 +194,12 @@ rotate_into_archive() {
     [ -n "$f" ] || continue
     name=$(basename "$f")
     [ "$name" != "$keep" ] || continue
-    mv "$f" "$dir/archive/$name"
+    move_no_replace "$f" "$dir/archive/$name" || {
+      echo "Error: rotation stopped at $f. Earlier files may already be in archive/." >&2
+      return 1
+    }
   done <<< "$listing"
+  return 0
 }
 
 # Lock the vault only if *this script* unlocked it, then drop the session
@@ -248,24 +220,44 @@ finish_bw_session() {
 # Cleanup trap (registered before any secret material exists)
 # ----
 random_dir=""
+encrypted_stage=""
 lock_held=0
+# Remove staging and explicitly report failure. Physical erasure is not
+# guaranteed. Only release the lock once staging paths have been removed.
+remove_plaintext() {
+  [ -n "$random_dir" ] && [ -d "$random_dir" ] || return 0
+  if command -v shred >/dev/null 2>&1; then
+    find "$random_dir" -type f -exec shred -u -n 3 {} \; || true
+  else
+    find "$random_dir" -type f -exec rm -P {} \; || true
+  fi
+  rm -rf -- "$random_dir" || return 1
+  [ ! -e "$random_dir" ] || return 1
+  random_dir=""
+}
 cleanup() {
-  set +e  # cleanup is best-effort; never abort mid-wipe
+  local status=$? cleanup_failed=0
+  trap - EXIT
+  set +e
   finish_bw_session
-  if [ -n "$random_dir" ] && [ -d "$random_dir" ]; then
-    # See secure_rm_file for the APFS caveat.
-    if command -v shred >/dev/null 2>&1; then
-      find "$random_dir" -type f -exec shred -u -n 3 {} \;
-    else
-      find "$random_dir" -type f -exec rm -P {} \;
-    fi
-    rm -rf "$random_dir"
+  if ! remove_plaintext; then
+    echo "Error: plaintext staging could not be removed: $random_dir" >&2
+    cleanup_failed=1
   fi
-  # Release the lock last, only once all plaintext has been wiped, so a
-  # concurrent run can never start while staging data still exists.
-  if [ "$lock_held" -eq 1 ]; then
-    rm -rf "$lock_dir"
+  if [ -n "$pending_dir" ]; then
+    rm -rf -- "$pending_dir" || cleanup_failed=1
   fi
+  if [ -n "$encrypted_stage" ]; then
+    rm -rf -- "$encrypted_stage" || cleanup_failed=1
+  fi
+  if [ "$cleanup_failed" -eq 0 ] && [ "$lock_held" -eq 1 ]; then
+    rm -rf -- "$lock_dir" || cleanup_failed=1
+  fi
+  if [ "$cleanup_failed" -ne 0 ]; then
+    echo "Error: cleanup incomplete. Inspect staging and the lock before retrying." >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
+  exit "$status"
 }
 # Signals only trigger an exit (with the conventional 128+signal status);
 # the single EXIT trap then performs cleanup exactly once.
@@ -398,6 +390,16 @@ list_unverified() {
   done | sort
 }
 
+# Historical keys may be expired for encryption but still decrypt old files.
+# GPG selects the required key/card from the ciphertext. Preserve diagnostics.
+decrypt_test() {
+  if [ "$interactive_session" -eq 0 ]; then
+    echo "Error: decrypting $1 requires an interactive run. Re-run --verify in a terminal." >&2
+    return 1
+  fi
+  gpg --decrypt "$1" >/dev/null
+}
+
 verify_pending() {
   local f name verified_name dir nas_copy nas_copy_dir local_verified
   local rc=0 count=0 nas_count=0
@@ -405,14 +407,6 @@ verify_pending() {
   local nas_dirs=("$nas_dir" "$nas_dir/archive")
   local nas_ok=0 local_pending nas_pending
 
-  if [[ ! -t 0 ]]; then
-    echo "Error: --verify needs an interactive session (YubiKey PIN entry)." >&2
-    return 1
-  fi
-  if ! card_has_enc_key; then
-    echo "Error: no YubiKey holding encryption key $gpg_enc_fpr is present; insert it and re-run --verify." >&2
-    return 1
-  fi
   if nas_available; then
     nas_ok=1
     echo "NAS mounted; NAS copies will be renamed too."
@@ -445,23 +439,23 @@ verify_pending() {
       fi
       # The NAS copy is only considered verified if it is byte-identical to
       # the local file we are about to decrypt-test.
-      if [ "$(sha256_of "$f")" != "$(sha256_of "$nas_copy")" ]; then
-        echo "Error: NAS copy $nas_copy differs from the local copy (SHA-256 mismatch); nothing renamed." >&2
+      if ! hashes_match "$f" "$nas_copy"; then
+        echo "Error: NAS copy $nas_copy differs from the local copy (SHA-256 mismatch or hash failure); nothing renamed." >&2
         rc=1; continue
       fi
     fi
-    if ! gpg --decrypt "$f" >/dev/null 2>&1; then
-      echo "Error: $name failed to decrypt — left as-is for inspection." >&2
+    if ! decrypt_test "$f"; then
+      echo "Error: $name failed to decrypt - left as-is for inspection." >&2
       rc=1; continue
     fi
 
-    # --- Phase 2: all checks passed — rename local, then NAS. ---
+    # --- Phase 2: all checks passed - rename local, then NAS. ---
     # Two separate renames cannot be atomic; if the second fails the NAS
     # copy stays '-unverified' and pass 2 below reconciles it later.
-    mv "$f" "$dir/$verified_name"
+    move_no_replace "$f" "$dir/$verified_name" || { rc=1; continue; }
     echo "  local: renamed to $dir/$verified_name"
     if [ -n "$nas_copy" ]; then
-      if mv "$nas_copy" "$nas_copy_dir/$verified_name"; then
+      if move_no_replace "$nas_copy" "$nas_copy_dir/$verified_name"; then
         echo "  nas:   renamed to $nas_copy_dir/$verified_name"
       else
         echo "Error: local copy renamed but NAS rename failed; NAS copy remains $nas_copy." >&2
@@ -489,18 +483,18 @@ verify_pending() {
       # Prefer matching against a verified local copy (current or archive/)
       # so the YubiKey is not needed; otherwise decrypt-test the NAS file.
       if local_verified=$(find_in_dirs "$verified_name" "${local_dirs[@]}"); then
-        if [ "$(sha256_of "$local_verified")" != "$(sha256_of "$f")" ]; then
-          echo "Error: NAS copy $name differs from verified local copy $local_verified (SHA-256 mismatch); left as-is." >&2
+        if ! hashes_match "$local_verified" "$f"; then
+          echo "Error: NAS copy $name differs from verified local copy $local_verified (SHA-256 mismatch or hash failure); left as-is." >&2
           rc=1; continue
         fi
         echo "  matches verified local copy $local_verified"
-      elif gpg --decrypt "$f" >/dev/null 2>&1; then
+      elif decrypt_test "$f"; then
         echo "  no local copy; decrypt test on NAS copy passed"
       else
-        echo "Error: no local copy and NAS copy $name failed to decrypt — left as-is." >&2
+        echo "Error: no local copy and NAS copy $name failed to decrypt - left as-is." >&2
         rc=1; continue
       fi
-      mv "$f" "$dir/$verified_name"
+      move_no_replace "$f" "$dir/$verified_name" || { rc=1; continue; }
       echo "  nas:   renamed to $dir/$verified_name"
     done <<< "$nas_pending"
     [ "$nas_count" -gt 0 ] || echo "No '-unverified' exports left on NAS (current or archive/)."
@@ -510,16 +504,19 @@ verify_pending() {
 }
 
 # ----
-# Mode dispatch — parsed before any tool/key checks so each mode only
+# Mode dispatch - parsed before any tool/key checks so each mode only
 # demands what it actually uses.
 # ----
+if [ "$#" -gt 1 ]; then
+  echo "Usage: $0 [--verify]" >&2
+  exit 2
+fi
 case "${1:-}" in
   --verify)
     # Needs only gpg (decrypt) and a SHA-256 tool; no bw/jq/zip/unzip and
     # no encryption-key resolution.
     require_cmds gpg
     require_sha256
-    resolve_gpg_enc_fpr
     acquire_lock
     verify_pending
     exit $?
@@ -549,7 +546,11 @@ case "$bw_status" in
     exit 1
     ;;
   locked)
-    echo "Vault is locked — unlocking..."
+    if [ "$interactive_session" -eq 0 ]; then
+      echo "Error: vault locked. Unattended exports require a usable BW_SESSION." >&2
+      exit 1
+    fi
+    echo "Vault is locked - unlocking..."
     # --raw prints only the session key; prompts for master password on the TTY
     BW_SESSION=$(bw unlock --raw)
     export BW_SESSION
@@ -577,57 +578,131 @@ tmp_root="${TMPDIR:-/tmp}"
 random_dir=$(mktemp -d "$tmp_root/bw_export_XXXXXXXXXX")
 
 # ----
-# Export vault
+# Export personal and organisation data, with explicit completeness checks.
 # ----
+validate_export() {
+  jq -e 'type == "object" and .encrypted == false and
+    (.items | type == "array") and
+    all(.items[]; (.id | type == "string") and (.id | test("^[A-Za-z0-9-]+$"))) and
+    (([.items[].id] | length) == ([.items[].id] | unique | length))' "$1" >/dev/null
+}
+
 bw sync
-echo "Exporting vault to $random_dir/bitwarden_export.json..."
 bw export --format json --output "$random_dir/bitwarden_export.json"
+validate_export "$random_dir/bitwarden_export.json" || {
+  echo "Error: invalid personal JSON export." >&2; exit 1;
+}
+bw list organizations > "$random_dir/organisations.json"
+jq -e 'type == "array" and all(.[];
+  (.id | type == "string") and (.id | test("^[A-Za-z0-9-]+$")))'   "$random_dir/organisations.json" >/dev/null
+org_ids=$(jq -r '.[].id' "$random_dir/organisations.json")
+export_files=("$random_dir/bitwarden_export.json")
+mkdir "$random_dir/organisations"
+while IFS= read -r org_id; do
+  [ -n "$org_id" ] || continue
+  org_export="$random_dir/organisations/$org_id.json"
+  echo "Exporting organisation $org_id..."
+  if ! bw export --organizationid "$org_id" --format json --output "$org_export"; then
+    echo "Error: organisation $org_id could not be exported. Check export permissions. No new backup installed." >&2
+    exit 1
+  fi
+  validate_export "$org_export" || { echo "Error: invalid organisation JSON: $org_id." >&2; exit 1; }
+  export_files+=("$org_export")
+done <<< "$org_ids"
 
-# ----
-# Download attachments
-# ----
-# Capture output first so a failure in 'bw list items' aborts the script
-# instead of silently producing an empty loop.
-# Only items with at least one attachment. The CLI reports '[]' (not null)
-# for items without attachments, so test the length rather than null-ness.
-items=$(bw list items | jq -c '.[] | select((.attachments // []) | length > 0)')
+# Build one inventory from all exports. Keep original JSON exports unchanged.
+jq -s '[.[].items[]] | unique_by(.id)' "${export_files[@]}" > "$random_dir/exported-items.json"
+bw list items > "$random_dir/visible-items.json"
+jq -e 'type == "array" and all(.[]; (.id | type == "string"))' "$random_dir/visible-items.json" >/dev/null
+jq -e --slurpfile exported "$random_dir/exported-items.json"   '([.[].id] - [$exported[0][].id]) | length == 0' "$random_dir/visible-items.json" >/dev/null || {
+    echo "Error: some visible vault items are missing from the exports." >&2; exit 1;
+  }
 
-# Process substitution (< <(...)) keeps the loop body in the current shell
-# so that (a) 'set -e' propagates failures from 'bw get attachment' to the
-# script, and (b) any variables set inside the loop are visible afterwards.
-# A pipe (printf | while) runs the loop in a subshell where failures are
-# silently swallowed.
-attachment_errors=0
-
-while IFS= read -r item; do
-  [ -n "$item" ] || continue
-  item_id=$(printf '%s' "$item" | jq -r '.id')
-
-  # Sanitise the item name for filesystem use and suffix with the id
-  # to avoid collisions between identically named items.
-  item_name=$(printf '%s' "$item" | jq -r '.name')
-  item_dir="$random_dir/$(sanitise_name "$item_name")_${item_id}"
-
-  mkdir -p "$item_dir"
-
+# Exports may cover organisation items outside the normal list. Fetch those
+# individually to obtain attachment metadata, failing if access is unavailable.
+item_ids=$(jq -r '.[].id' "$random_dir/exported-items.json")
+: > "$random_dir/attachments.ndjson"
+attachment_count=0
+expected_attachments=0
+while IFS= read -r item_id; do
+  [ -n "$item_id" ] || continue
+  item=$(jq -c --arg id "$item_id" '.[] | select(.id == $id)' "$random_dir/visible-items.json")
+  if [ -z "$item" ]; then
+    item=$(bw get item "$item_id") || {
+      echo "Error: cannot inspect exported item $item_id for attachments." >&2; exit 1;
+    }
+  fi
+  printf '%s\n' "$item" | jq -e --arg id "$item_id" '
+    .id == $id and ((.attachments // []) | type == "array") and
+    all((.attachments // [])[];
+      (.id | type == "string") and (.id | test("^[A-Za-z0-9-]+$")) and
+      (.fileName | type == "string"))' >/dev/null
+  attachments=$(printf '%s\n' "$item" | jq -c '(.attachments // [])[]')
   while IFS= read -r att; do
-    attachment_name=$(printf '%s' "$att" | jq -r '.fileName')
-    attachment_id=$(printf '%s' "$att" | jq -r '.id')
-    safe_name=$(sanitise_name "$attachment_name")
-    echo "Downloading '$attachment_name' for item '$item_name'..."
-    # Fetch by attachment id (not filename) so two identically named
-    # attachments on one item each download their own content.
-    if ! bw get attachment "$attachment_id" --itemid "$item_id" --output "$item_dir/${attachment_id}_${safe_name}"; then
-      echo "Error: failed to download attachment '$attachment_name' (id: $attachment_id) for item '$item_name'." >&2
-      attachment_errors=$((attachment_errors + 1))
-    fi
-  done < <(printf '%s' "$item" | jq -c '.attachments[]')
-done < <(printf '%s\n' "$items")
+    [ -n "$att" ] || continue
+    expected_attachments=$((expected_attachments + 1))
+    attachment_id=$(printf '%s\n' "$att" | jq -r '.id')
+    attachment_name=$(printf '%s\n' "$att" | jq -r '.fileName')
+    relative_path="attachments/$item_id/${attachment_id}_$(sanitise_name "$attachment_name")"
+    mkdir -p "$random_dir/attachments/$item_id"
+    attachment_path="$random_dir/$relative_path"
+    [ ! -e "$attachment_path" ] || { echo "Error: duplicate attachment ID." >&2; exit 1; }
+    bw get attachment "$attachment_id" --itemid "$item_id" --output "$attachment_path" >/dev/null || {
+      echo "Error: attachment download failed for $item_id/$attachment_id." >&2; exit 1;
+    }
+    [ -f "$attachment_path" ] || { echo "Error: attachment file missing." >&2; exit 1; }
+    actual_size=$(wc -c < "$attachment_path" | tr -d '[:space:]')
+    expected_size=$(printf '%s\n' "$att" | jq -r '.size // empty')
+    # Preserve the service's size separately. Do not assume it represents
+    # plaintext length across client/server versions or encrypted storage.
+    # The local plaintext size and hash below describe the downloaded file.
+    attachment_sha=$(sha256_of "$attachment_path")
+    # Read fileName directly from JSON so original trailing newlines survive.
+    printf '%s\n' "$att" | jq -c --arg item "$item_id" --arg path "$relative_path"       --arg sha "$attachment_sha" --arg metadata_size "$expected_size" --argjson bytes "$actual_size"       '{item_id:$item, attachment_id:.id, original_filename:.fileName,
+        path:$path, size_bytes:$bytes, service_reported_size:$metadata_size, sha256:$sha}' >> "$random_dir/attachments.ndjson"
+    attachment_count=$((attachment_count + 1))
+  done <<< "$attachments"
+done <<< "$item_ids"
+[ "$attachment_count" -eq "$expected_attachments" ] || exit 1
 
-if [[ "$attachment_errors" -gt 0 ]]; then
-  echo "Error: $attachment_errors attachment(s) failed to download. Aborting." >&2
-  exit 1
-fi
+jq -s '.' "$random_dir/attachments.ndjson" > "$random_dir/attachments.json"
+jq -n --slurpfile organisations "$random_dir/organisations.json"   --slurpfile items "$random_dir/exported-items.json"   --slurpfile attachments "$random_dir/attachments.json"   --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)"   '{schema_version:1, script_version:"1.5.0", created_utc:$created,
+    coverage:"Personal vault plus every listed organisation. Attachments for all exported items.",
+    exclusions:["Trash", "Sends", "Server/account configuration"],
+    verification:"JSON structure, visible item coverage, attachment downloads and ZIP integrity checked. Attachment plaintext sizes/hashes recorded. Not restore-tested.",
+    personal_export:"bitwarden_export.json",
+    organisations:[$organisations[0][] | {id, name, export_path:("organisations/" + .id + ".json")}],
+    item_count:($items[0] | length), attachment_count:($attachments[0] | length),
+    attachments:$attachments[0]}' > "$random_dir/manifest.json"
+cat > "$random_dir/RECOVERY.txt" <<'RECOVERY'
+Bitwarden backup recovery - bw-export.sh 1.5.0
+
+Decrypt the .gpg file with its matching private key/YubiKey and extract the ZIP
+into a private location on an encrypted disk. Test ZIP integrity before use.
+
+bitwarden_export.json: personal vault export.
+organisations/<id>.json: separate organisation exports.
+manifest.json: scope, excluded data, item/attachment counts, original filenames,
+parent item IDs, attachment paths, byte sizes and SHA-256 digests.
+
+Import personal and organisation JSON separately into the appropriate vaults.
+Use a disposable test vault first. Imports can create duplicate items.
+Attachments are separate files and require explicit reattachment. Use the
+manifest and original exported item IDs to map each file to its parent record.
+Newly imported items may have new IDs. Restore each original filename from the
+manifest. Verify attachment sizes/hashes and inspect representative records.
+
+A filename without '-unverified' indicates a successful GPG decrypt test (or a
+successful hash comparison to such a file). It is NOT evidence of a test import
+or complete recovery. Older backups may lack this manifest and these notes.
+Trash, Sends and server/account configuration are not included.
+Keep historical private keys or recovery key material available independently
+of the vault. Remove plaintext recovery files when finished.
+RECOVERY
+# Intermediate inventories contain secrets. Remove before creating the ZIP.
+for intermediate in exported-items.json visible-items.json organisations.json attachments.ndjson attachments.json; do
+  secure_rm_file "$random_dir/$intermediate"
+done
 
 # We no longer need the vault: re-lock it if we unlocked it, and drop the
 # session key from the environment.
@@ -637,64 +712,50 @@ finish_bw_session
 # Zip, validate, encrypt
 # ----
 # Subshell keeps the script's working directory unchanged
-(cd "$random_dir" && zip -r "$zip_file" .)
+(cd "$random_dir" && zip -qr "$zip_file" .)
 
-# Validate the archive before we encrypt it — a corrupt ZIP is not a backup.
+# Validate the archive before we encrypt it - a corrupt ZIP is not a backup.
 echo "Testing ZIP integrity..."
 if ! unzip -tq "$random_dir/$zip_file" >/dev/null; then
   echo "Error: ZIP integrity test failed for $zip_file. Aborting." >&2
   exit 1
 fi
 
-# Encryption uses only the public key — the YubiKey is not needed here.
+# Encryption uses only the public key - the YubiKey is not needed here.
 # The '!' suffix forces gpg to use exactly the resolved subkey.
+encrypted_stage=$(mktemp -d "$downloads_dir/.bw-export-encrypted-XXXXXXXXXX")
 gpg --batch --trust-model always \
     --recipient "${gpg_enc_fpr}!" \
-    --output "$random_dir/$zip_file.gpg" \
+    --output "$encrypted_stage/$zip_file.gpg" \
     --encrypt "$random_dir/$zip_file"
-echo "Encrypted export written to staging: $random_dir/$zip_file.gpg"
+echo "Encrypted export prepared."
 
-# The plaintext ZIP is no longer needed — remove it now rather than
-# leaving it around until the EXIT trap.
-secure_rm_file "$random_dir/$zip_file"
+# Remove the entire plaintext working set before PIN entry or replication.
+remove_plaintext || { echo "Error: plaintext cleanup failed." >&2; exit 1; }
 
-# ----
-# Verify the export is decryptable (requires YubiKey + PIN)
-# ----
-# A backup that can't be decrypted is worthless — hard-fail before the
-# previous local export is rotated out or anything is copied to the NAS.
-# The decryption test requires the YubiKey + interactive PIN entry.
-#
-# Policy when the test cannot run — non-interactive session (cron/launchd)
-# or no YubiKey holding the key inserted: the export IS installed and
-# replicated — an unverified backup is better than none — but under a
-# distinct '-unverified' name so it can never be confused with a
-# recovery-tested backup. Run '--verify' later to test and rename it.
-#
-# When the test CAN run (interactive + key present) a failure is a hard
-# error: the key is there, so an undecryptable file means something is
-# genuinely wrong (wrong card, PIN failures, corrupt output).
+# Decryption verification is optional when no interactive card is available.
+# Failure with the card present preserves ciphertext for inspection.
 final_name="$zip_file.gpg"
 skip_reason=""
-if [[ ! -t 0 ]]; then
+if [ "$interactive_session" -eq 0 ]; then
   skip_reason="non-interactive session"
 elif ! card_has_enc_key; then
   skip_reason="no YubiKey holding encryption key $gpg_enc_fpr is present"
 fi
 if [ -n "$skip_reason" ]; then
   final_name="${zip_file%.zip}-unverified.zip.gpg"
-  echo "Warning: $skip_reason — decrypt verification skipped." >&2
-  echo "Export will be installed as $final_name (NOT recovery-tested)." >&2
+  echo "Warning: $skip_reason - decrypt verification skipped." >&2
+  echo "Export will be installed as $final_name (decryption NOT verified)." >&2
   echo "Run '$0 --verify' with the YubiKey present to decrypt-test it and" >&2
   echo "rename the local and NAS copies to '$zip_file.gpg'." >&2
 else
-  if gpg --decrypt "$random_dir/$zip_file.gpg" >/dev/null 2>&1; then
+  if decrypt_test "$encrypted_stage/$zip_file.gpg"; then
     echo "Decryption test passed."
   else
     # Keep the file out of the rotation glob so it is never installed,
     # rotated or replicated as a backup, but retain it for inspection.
     failed_copy="$downloads_dir/DECRYPT-FAILED-$zip_file.gpg"
-    mv "$random_dir/$zip_file.gpg" "$failed_copy"
+    move_no_replace "$encrypted_stage/$zip_file.gpg" "$failed_copy"
     echo "Error: YubiKey present but the export could not be decrypted (wrong card, PIN, or corrupt output)." >&2
     echo "Encrypted file kept at $failed_copy for inspection; previous export left in place, NAS copy skipped." >&2
     exit 1
@@ -702,59 +763,32 @@ else
 fi
 
 # ----
-# Rotate previous local export(s) and install the new one
+# Publish before rotating. On any failure, existing backups remain available.
 # ----
-# Deferred until here so that a failure anywhere above (export, zip test,
-# encryption, or an interactive decrypt test) leaves the previous export
-# untouched in $downloads_dir. Note: in an unattended run the decrypt test
-# is skipped by design, so a new '-unverified' export deliberately becomes
-# current here and the previous (possibly verified) export is rotated into
-# archive/. It is not deleted, and the '-unverified' name makes the
-# distinction visible until '--verify' has been run.
-if [ -e "$downloads_dir/$final_name" ]; then
-  echo "Error: $downloads_dir/$final_name already exists; refusing to overwrite. New export left in staging and will be wiped." >&2
+if ! install_checked "$encrypted_stage/$zip_file.gpg" "$downloads_dir/$final_name"; then
+  echo "Error: local installation failed. Previous backups retained." >&2
   exit 1
 fi
-if ! rotate_into_archive "$downloads_dir"; then
-  echo "Error: local rotation aborted; new export left in staging and will be wiped. Previous export untouched." >&2
-  exit 1
-fi
-mv "$random_dir/$zip_file.gpg" "$downloads_dir/$final_name"
 echo "Encrypted export saved to $downloads_dir/$final_name"
+if ! rotate_into_archive "$downloads_dir" "$final_name"; then
+  echo "Error: local rotation incomplete. New backup retained. Older files may be in current or archive/." >&2
+  exit 1
+fi
 
-# ----
-# Copy to NAS if mounted
-# ----
 if nas_available; then
   mkdir -p "$nas_dir/archive"
-  if [ -e "$nas_dir/$final_name" ]; then
-    echo "Error: $nas_dir/$final_name already exists; refusing to overwrite. NAS copy skipped." >&2
+  echo "Copying encrypted export to NAS..."
+  if ! install_checked "$downloads_dir/$final_name" "$nas_dir/$final_name"; then
+    echo "Error: NAS installation failed. Local backup retained. Existing NAS backups were not rotated." >&2
     exit 1
   fi
-  echo "Copying $final_name to $nas_dir"
-  cp "$downloads_dir/$final_name" "$nas_dir/"
-
-  # Verify the copy byte-for-byte before rotating the previous NAS export.
-  src_sha=$(sha256_of "$downloads_dir/$final_name")
-  dst_sha=$(sha256_of "$nas_dir/$final_name")
-  if [ "$src_sha" != "$dst_sha" ]; then
-    echo "Error: NAS copy verification failed (SHA-256 mismatch)." >&2
-    echo "  local: $src_sha" >&2
-    echo "  nas:   $dst_sha" >&2
-    rm -f -- "$nas_dir/$final_name"
-    echo "Corrupt NAS copy removed; previous NAS export left in place." >&2
-    exit 1
-  fi
-  echo "NAS copy verified (SHA-256 $src_sha)."
-
-  # Rotate everything except the file we just copied.
+  echo "NAS copy verified by SHA-256 and published."
   if ! rotate_into_archive "$nas_dir" "$final_name"; then
-    echo "Error: NAS rotation aborted; new NAS copy $final_name kept alongside the previous export(s)." >&2
+    echo "Error: NAS rotation incomplete. New backup retained. Older files may be in current or archive/." >&2
     exit 1
   fi
 else
-  echo "NAS not mounted at $nas_mount (or $nas_dir missing) — skipping NAS copy."
+  echo "NAS unavailable at $nas_mount (or $nas_dir missing). Local backup only."
 fi
 
-echo "Bitwarden export completed."
-
+echo "Bitwarden export completed. Decryption verification is not a restore test."
