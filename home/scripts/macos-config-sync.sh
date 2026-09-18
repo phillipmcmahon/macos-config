@@ -2,7 +2,33 @@
 #
 # macos-config-sync.sh
 #
-# Version: 3.0.1
+# Version: 3.1.0
+#
+# v3.1.0 (review remediation):
+#   F1 DONE: Resume is invoked outside conditional function contexts. Critical
+#     fetch, scan, push, backup and deployment failures stop the transaction.
+#   F2 DONE: Persistent SHA-256 HOME snapshots guard normal and resumed runs.
+#     Deployment journals the target and checks each file before atomic replace.
+#   F3 DONE: A machine-specific deployed Git ref replaces the HEAD assumption.
+#     Existing installations explicitly adopt a baseline. Fresh Macs restore.
+#   F4 DONE: Secret scans read extracted blobs, never early-exit pipelines.
+#     Extraction/read errors fail closed. Final outgoing history is rescanned.
+#   F5 DONE: Collection and deployment compare file contents. Rsync uses
+#     checksums for backup, restore and NAS operations as well.
+#   F6 DONE: NAS completion has a separate commit/destination receipt. Failed
+#     or unavailable mirrors are retried, including on otherwise unchanged runs.
+#   A1 DONE: Dry-run does not execute capture, prune, state writes or deployment.
+#   A2 DONE: Generated files are staged outside HOME until successful deployment.
+#   A3 DONE: Missing managed directories record tracked-file deletions.
+#   A4 DONE: init no longer regenerates support files or dirties a clone.
+#   A5 DONE: New directory files remain local until 'add PATH'. 'forget PATH'
+#     keeps the local copy and stops this machine managing it. AUTO_ADD=1 is
+#     the explicit opt-in to the previous automatic enrolment behaviour.
+#   Requires Python 3 for path-safe content manifests and atomic file writes.
+#   First use after upgrading: inspect the checkout, then run 'adopt' if it
+#     represents the last state applied to this Mac. Do not adopt a fresh clone
+#     over unrelated HOME contents: use an explicit pull/restore instead.
+#   Historical release notes below describe behaviour at the stated version.
 #
 # v3.0.1:
 #   - Improved: sync now stops after reconciliation when the final Git commit
@@ -422,7 +448,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="3.0.1"
+readonly SCRIPT_VERSION="3.1.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -468,12 +494,12 @@ DRY_RUN="${DRY_RUN:-0}"
 # Deletions are never propagated silently by sync. Interactive runs prompt;
 # unattended runs must opt in explicitly with ACCEPT_DELETIONS=1.
 ACCEPT_DELETIONS="${ACCEPT_DELETIONS:-0}"
+AUTO_ADD="${AUTO_ADD:-0}"
+GENERATED_ROOT=""
+SYNC_STATE=""
+SCAN_TEMP_DIR=""
 
-# When set to 1, the staleness guard (check_for_unrestored_remote_changes)
-# is bypassed — the push proceeds even when the remote contains changes
-# that have not been restored locally. Use with care: this can overwrite
-# configuration pushed from another machine.
-FORCE_PUSH="${FORCE_PUSH:-0}"
+# FORCE_PUSH no longer bypasses reconciliation. Reject an old unsafe setting.
 
 # ----
 # Managed paths
@@ -582,6 +608,7 @@ unset _pat
 
 COMMON_RSYNC_OPTIONS=(
     --archive
+    --checksum
     --human-readable
     --itemize-changes
     --protect-args
@@ -688,6 +715,14 @@ trap 'on_error "$LINENO"' ERR
 # ----
 
 local_path() {
+    case "$1" in
+        Brewfile|installed-apps.txt|Moom.plist)
+            if [[ -n "$GENERATED_ROOT" ]]; then
+                printf '%s/%s\n' "$GENERATED_ROOT" "$1"
+                return 0
+            fi
+            ;;
+    esac
     printf '%s/%s\n' "$HOME" "$1"
 }
 
@@ -697,12 +732,6 @@ repository_path() {
 
 # Resolved once by ensure_machine_name(); used for all machine-specific paths.
 MACHINE=""
-
-# Set by update_from_remote_before_push() to the commit hash before the
-# rebase. Used by check_for_unrestored_remote_changes() to identify which
-# files were actually changed by the remote — so that only genuinely
-# unrestored changes are flagged, not normal local edits.
-PRE_REBASE_HEAD=""
 
 ensure_machine_name() {
     [[ -n "$MACHINE" ]] || MACHINE="$(detect_machine_name)"
@@ -780,6 +809,10 @@ Usage:
 
 Commands:
   init        Clone or initialise the local repository
+  adopt       Explicitly trust current checkout as this Mac's deployed baseline
+  add PATH    Enrol one HOME-relative file inside configured managed paths
+  forget PATH Keep the local file but remove its repository copy on next sync
+  cancel      Preserve a pending proposal and reset the checkout, never HOME
   sync        Reconcile the Mac and GitHub, then update both safely
   push        Compatibility alias for sync
   pull        Force GitHub state onto the Mac (destructive mirror)
@@ -828,17 +861,28 @@ Environment overrides:
                     (default: \$HOME/.local/state/macos-config/run.lock)
   MACHINE_NAME      Override the auto-detected machine name (default:
                     scutil --get LocalHostName, fallback: hostname -s)
-  DRY_RUN=1         Log commands without executing them
+  DRY_RUN=1         Read-only operation explanation, not a computed remote diff
+  AUTO_ADD=1        Opt in to automatic enrolment of new directory files
   ACCEPT_DELETIONS=1
                     Allow sync to propagate displayed deletions without an
                     interactive confirmation (required for unattended runs)
-  FORCE_PUSH=1      Skip the staleness guard and push even when the
-                    remote has unrestored changes (legacy workflow only)
 
 Normal use:
   Run '$SCRIPT_NAME sync' on each Mac. The script snapshots local changes
   before fetching, lets Git reconcile them with GitHub, and changes HOME only
   after reconciliation succeeds. Pull and restore are recovery commands.
+
+Upgrade from v3.0 on an already-synchronised Mac:
+  $SCRIPT_NAME adopt
+  $SCRIPT_NAME sync
+
+Only adopt if the checkout represents the last state applied to this Mac.
+New Macs should explicitly pull/restore, which records a deployed baseline.
+Python 3 is required. New directory files stay local until 'add scripts/foo.sh'.
+'forget' preserves this Mac's local file but proposes a repository deletion,
+which other Macs will see on their next sync. Excluded credentials cannot be added.
+Pending transactions refuse changed HOME files or changed ownership settings.
+Use cancel to preserve the proposal and recapture HOME, not a force overwrite.
 EOF
 }
 
@@ -852,6 +896,7 @@ require_command() {
 }
 
 validate_dependencies() {
+    require_command python3
     require_command git
     require_command rsync
     require_command ssh
@@ -900,9 +945,9 @@ validate_configuration() {
 
     [[ "$ACCEPT_DELETIONS" == "0" || "$ACCEPT_DELETIONS" == "1" ]] ||
         die "ACCEPT_DELETIONS must be either 0 or 1."
+    [[ "$AUTO_ADD" == "0" || "$AUTO_ADD" == "1" ]] || die "AUTO_ADD must be 0 or 1."
 
-    [[ "$FORCE_PUSH" == "0" || "$FORCE_PUSH" == "1" ]] ||
-        die "FORCE_PUSH must be either 0 or 1."
+    [[ "${FORCE_PUSH:-0}" == "0" ]] || die "FORCE_PUSH is retired. Resolve conflicts explicitly."
 
     # NAS_SSH_DIR is interpolated into remote shell commands (--rsync-path
     # and ssh "test -d ..."). Restrict it to a safe relative path to prevent
@@ -970,12 +1015,12 @@ show_tool_versions() {
 # ----
 
 acquire_lock() {
-    mkdir -p "$(dirname "$LOCK_DIR")"
-
     if [[ "$DRY_RUN" == "1" ]]; then
         log "DRY-RUN: Would acquire lock: $LOCK_DIR"
         return 0
     fi
+
+    mkdir -p "$(dirname "$LOCK_DIR")"
 
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         printf '%s\n' "$$" >"$LOCK_DIR/pid"
@@ -1002,6 +1047,10 @@ acquire_lock() {
 }
 
 release_lock() {
+    if [[ -n "$SCAN_TEMP_DIR" ]]; then
+        rm -f "$SCAN_TEMP_DIR/blob" "$SCAN_TEMP_DIR/paths" "$SCAN_TEMP_DIR/commits"
+        rmdir "$SCAN_TEMP_DIR" 2>/dev/null || true
+    fi
     [[ "$DRY_RUN" == "1" ]] || rm -rf "$LOCK_DIR"
 }
 
@@ -1027,7 +1076,9 @@ repository_has_commits() {
 }
 
 repository_is_clean() {
-    [[ -z "$(git -C "$REPO_DIR" status --porcelain)" ]]
+    local status
+    status="$(git -C "$REPO_DIR" status --porcelain)" || die "Cannot inspect repository status."
+    [[ -z "$status" ]]
 }
 
 configure_repository_for_sync() {
@@ -1057,7 +1108,7 @@ ensure_repository_structure() {
     done
 
     # Machine directories are NOT pre-created here. They are created on
-    # demand during collect_local_files only when the source file/directory
+    # demand during collection only when the source file/directory
     # actually exists — otherwise empty machine trees linger in the
     # repository and get mirrored to NAS (fixed in v2.0.1).
 }
@@ -1175,40 +1226,10 @@ reject_symlinks_in_directory() {
     fi
 }
 
-collect_managed_file() {
-    local source_file="$1"
-    local repository_file="$2"
+# Scope helpers used to label deletion proposals. Removing an array entry no
+# longer silently prunes repository history. Use forget while still in scope,
+# or inspect and remove the repository path explicitly.
 
-    # Path-component validation is performed by the caller (collect_local_files)
-    # before entering this function — no per-file symlink check needed here.
-
-    if [[ -e "$source_file" ]]; then
-        sync_file "$source_file" "$repository_file"
-        return 0
-    fi
-
-    if [[ -e "$repository_file" || -L "$repository_file" ]]; then
-        log "Local file was removed. Removing repository copy: $repository_file"
-        run rm -f "$repository_file"
-    else
-        warn "Managed file does not exist: $source_file"
-    fi
-}
-
-# ----
-# Repository pruning
-# ----
-#
-# Removing a path from MANAGED_FILES or MANAGED_DIRECTORIES must also remove
-# its old copy from the repository. Otherwise, stale files remain tracked and
-# may be restored by a later pull.
-#
-# A repository path is retained when it is:
-#   - an exact managed file
-#   - an exact managed directory
-#   - inside a managed directory
-#   - a parent directory required by a nested managed path
-#
 
 is_managed_repository_path() {
     local candidate="$1"
@@ -1232,34 +1253,8 @@ is_managed_repository_path() {
     return 1
 }
 
-prune_unmanaged_repository_paths() {
-    local repository_home="$REPO_DIR/home"
-    local item
-    local relative_path
 
-    [[ -d "$repository_home" ]] || return 0
-
-    step "Removing repository paths that are no longer managed"
-
-    while IFS= read -r -d '' item; do
-        relative_path="${item#"$repository_home"/}"
-
-        if ! is_managed_repository_path "$relative_path"; then
-            log "Removing unmanaged repository path: home/$relative_path"
-            run rm -rf "$item"
-        fi
-    done < <(
-        find "$repository_home" \
-            -mindepth 1 \
-            -depth \
-            -print0
-    )
-}
-
-# Machine-tree retention mirrors is_managed_repository_path, but against the
-# MACHINE_* arrays. Only the CURRENT machine's tree is ever pruned — other
-# machines' directories under machines/ are never touched, because this
-# machine cannot know what is stale for them.
+# Machine scope mirrors the shared scope helper, but only for this machine.
 
 is_machine_repository_path() {
     local candidate="$1"
@@ -1283,44 +1278,6 @@ is_machine_repository_path() {
     return 1
 }
 
-prune_unmanaged_machine_paths() {
-    local machine_home
-    machine_home="$(machine_repository_root)/home"
-
-    local item
-    local relative_path
-
-    [[ -d "$machine_home" ]] || return 0
-
-    step "Removing machine paths that are no longer managed (machine: $MACHINE)"
-
-    while IFS= read -r -d '' item; do
-        relative_path="${item#"$machine_home"/}"
-
-        if ! is_machine_repository_path "$relative_path"; then
-            log "Removing unmanaged machine path: machines/$MACHINE/home/$relative_path"
-            run rm -rf "$item"
-        fi
-    done < <(
-        find "$machine_home" \
-            -mindepth 1 \
-            -depth \
-            -print0
-    )
-
-    # Clean up empty directories left behind after pruning (or after
-    # collect_managed_file removed a stale file). Without this, empty
-    # machine trees linger in the repository and get mirrored to NAS.
-    find "$(machine_repository_root)" \
-        -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
-
-    # If the machine root itself is now empty, remove it.
-    rmdir "$(machine_repository_root)" 2>/dev/null || true
-
-    # If no machine trees remain at all, remove the top-level machines/
-    # directory so it does not clutter the repository or NAS mirror.
-    rmdir "$REPO_DIR/machines" 2>/dev/null || true
-}
 
 # ----
 # Repository support files
@@ -1331,6 +1288,8 @@ create_repository_files() {
     local gitignore="$REPO_DIR/.gitignore"
     local readme="$REPO_DIR/README.md"
     local path
+    reject_symlink_components "$REPO_DIR" '.gitignore' 'repository support file'
+    reject_symlink_components "$REPO_DIR" 'README.md' 'repository support file'
 
     if [[ "$DRY_RUN" == "1" ]]; then
         log "DRY-RUN: Would regenerate $gitignore"
@@ -1403,7 +1362,32 @@ EOF
         fi
         cat <<'EOF'
 
-Caches, logs and known credential files (for example `hosts.yml`, `rclone.conf`, `*.token`, `*.key`) are excluded from directory syncs via `EXCLUDE_PATTERNS` in `macos-config-sync.sh`. Add any experimental or deliberately local-only filename pattern there so it is neither collected nor removed by routine sync.
+Caches, logs and known credential files are excluded via `EXCLUDE_PATTERNS`.
+New files inside managed directories are local-only by default. Enrol one with
+`macos-config-sync.sh add scripts/example.sh`, then run `sync`.
+`forget scripts/example.sh` keeps this Mac's local file and proposes deleting
+the repository copy. Other Macs will see that deletion. `AUTO_ADD=1` explicitly
+enables the older automatic-enrolment behaviour. Individual configured files
+are always managed unless forgotten or excluded.
+
+## Baseline and recovery
+
+After upgrading an already-synchronised Mac, inspect the checkout and run
+`macos-config-sync.sh adopt` once. This explicitly trusts it as the last deployed
+state. Fresh Macs should use deliberate `pull` or `restore` instead.
+Python 3 is required. Pending transactions check SHA-256 HOME snapshots before
+deploying and stop if newer local edits exist. Resolve rebase conflicts inside
+the repository and run `git rebase --continue`, then `sync`.
+To abandon a proposal, abort any active rebase first and run `cancel`. It
+preserves commits and uncommitted changes before resetting the private checkout,
+and never changes HOME. Cancel is not a rollback of an already published commit.
+Avoid editing managed HOME files during deployment. Each replacement is atomic,
+but the collection of files is not a filesystem-wide atomic transaction.
+
+A no-change run skips backup and deployment, but retries an outstanding NAS
+mirror. NAS completion is tracked separately from Git completion.
+`DRY_RUN=1` prints an operation explanation without mutating files or fetching.
+It is not a computed reconciliation preview.
 
 ## Restore
 
@@ -1449,8 +1433,6 @@ fi
 
 if repository_exists; then
     log "Repository is already initialised: $REPO_DIR"
-    ensure_repository_structure
-    create_repository_files
     configure_repository_for_sync
     return 0
 fi
@@ -1482,8 +1464,6 @@ else
     git -C "$REPO_DIR" checkout -B "$GIT_BRANCH"
 fi
 
-ensure_repository_structure
-create_repository_files
 configure_repository_for_sync
 
 ok "Repository initialised: $REPO_DIR"
@@ -1524,6 +1504,8 @@ generate_brewfile() {
 generate_installed_apps_list() {
     local output_file
     output_file="$(local_path "installed-apps.txt")"
+
+    [[ -d /Applications ]] || { warn "No /Applications directory. Inventory generation skipped."; return 0; }
 
     step "Generating installed applications list: $output_file"
 
@@ -1617,151 +1599,7 @@ restore_moom_preferences() {
 # ----
 # Mac to repository
 # ----
-collect_local_files() {
-local path
 
-require_repository
-ensure_machine_name
-
-# Validate repository destination path components before
-# ensure_repository_structure creates directories or any files are written.
-# A symlink inside $REPO_DIR (from a prior compromised push, manual edit, or
-# NAS restore) could redirect mkdir -p or rsync writes outside the
-# repository.
-for path in "${MANAGED_DIRECTORIES[@]}"; do
-    reject_symlink_components "$REPO_DIR" "home/$path" "repo: home/$path"
-done
-
-for path in "${MANAGED_FILES[@]}"; do
-    reject_symlink_components "$REPO_DIR" "home/$path" "repo: home/$path"
-done
-
-for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
-    reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo: machines/$MACHINE/home/$path"
-done
-
-for path in "${MACHINE_FILES[@]}"; do
-    reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo: machines/$MACHINE/home/$path"
-done
-
-ensure_repository_structure
-
-# Validate every path component from $HOME to each managed leaf, and scan
-# existing repository destination directories for interior symlinks, before
-# any sync runs.
-for path in "${MANAGED_DIRECTORIES[@]}"; do
-    reject_symlink_components "$HOME" "$path" "~/$path"
-    reject_symlinks_in_directory "$(local_path "$path")" "~/$path"
-    reject_symlinks_in_directory "$(repository_path "$path")" "repo: home/$path"
-done
-
-for path in "${MANAGED_FILES[@]}"; do
-    reject_symlink_components "$HOME" "$path" "~/$path"
-done
-
-for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
-    reject_symlink_components "$HOME" "$path" "~/$path"
-    reject_symlinks_in_directory "$(machine_repository_path "$path")" "repo: machines/$MACHINE/home/$path"
-done
-
-for path in "${MACHINE_FILES[@]}"; do
-    reject_symlink_components "$HOME" "$path" "~/$path"
-done
-
-for path in "${MANAGED_DIRECTORIES[@]}"; do
-    log "Copying ~/$path into the repository"
-
-    sync_directory \
-        "$(local_path "$path")" \
-        "$(repository_path "$path")" \
-        "${DIRECTORY_EXCLUDES[@]}" \
-        --exclude='.git/'
-done
-
-for path in "${MANAGED_FILES[@]}"; do
-    log "Copying ~/$path into the repository"
-
-    collect_managed_file \
-        "$(local_path "$path")" \
-        "$(repository_path "$path")"
-done
-
-for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
-    if [[ -d "$(local_path "$path")" ]]; then
-        reject_symlinks_in_directory "$(local_path "$path")" "~/$path"
-        log "Copying ~/$path into the repository (machine: $MACHINE)"
-
-        run mkdir -p "$(machine_repository_path "$path")"
-        sync_directory \
-            "$(local_path "$path")" \
-            "$(machine_repository_path "$path")" \
-            "${DIRECTORY_EXCLUDES[@]}" \
-            --exclude='.git/'
-    elif [[ -d "$(machine_repository_path "$path")" ]]; then
-        log "Local directory was removed. Removing repository copy: machines/$MACHINE/home/$path"
-        run rm -rf "$(machine_repository_path "$path")"
-    else
-        warn "Managed directory does not exist: $(local_path "$path")"
-    fi
-done
-
-for path in "${MACHINE_FILES[@]}"; do
-    log "Copying ~/$path into the repository (machine: $MACHINE)"
-
-    # Create parent directory on demand — only when the source file exists.
-    if [[ -e "$(local_path "$path")" || -L "$(local_path "$path")" ]]; then
-        run mkdir -p "$(dirname "$(machine_repository_path "$path")")"
-    fi
-
-    collect_managed_file \
-        "$(local_path "$path")" \
-        "$(machine_repository_path "$path")"
-done
-}
-
-update_from_remote_before_push() {
-require_repository
-
-if ! remote_branch_exists; then
-    log "Remote branch does not yet exist: $GIT_BRANCH"
-    return 0
-fi
-
-# Auto-stash any uncommitted changes (e.g. manual edits or file copies
-# made directly in the repo dir) so the fetch/rebase has a clean tree.
-# The stash is popped after rebase, letting commit_and_push pick them up.
-local stashed=0
-if ! repository_is_clean; then
-    step "Stashing uncommitted changes before remote update"
-    run git -C "$REPO_DIR" stash push -m "macos-config-sync: auto-stash before rebase"
-    stashed=1
-fi
-
-step "Fetching current remote branch"
-
-run git -C "$REPO_DIR" fetch origin "$GIT_BRANCH"
-
-if [[ "$DRY_RUN" == "1" ]]; then
-    (( stashed )) && run git -C "$REPO_DIR" stash pop
-    return 0
-fi
-
-# Record the current HEAD before the rebase so the staleness guard can
-# diff against it later to identify files actually changed by the remote.
-if repository_has_commits; then
-    PRE_REBASE_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD)"
-    git -C "$REPO_DIR" rebase "origin/$GIT_BRANCH"
-else
-    git -C "$REPO_DIR" checkout \
-        -B "$GIT_BRANCH" \
-        "origin/$GIT_BRANCH"
-fi
-
-if (( stashed )); then
-    step "Restoring stashed changes"
-    git -C "$REPO_DIR" stash pop || die "Stash pop failed — resolve conflicts in $REPO_DIR"
-fi
-}
 
 # True when local commits exist that the remote branch does not have —
 # either the remote branch is missing entirely, or the local branch is
@@ -1777,48 +1615,11 @@ has_unpushed_commits() {
         return 0
     fi
 
-    [[ -n "$(git -C "$REPO_DIR" rev-list "origin/$GIT_BRANCH..$GIT_BRANCH" 2>/dev/null)" ]]
+    local commits
+    commits="$(git -C "$REPO_DIR" rev-list "origin/$GIT_BRANCH..$GIT_BRANCH")" || die "Cannot inspect unpushed history."
+    [[ -n "$commits" ]]
 }
 
-commit_and_push() {
-require_repository
-
-# Files are already staged by scan_for_secrets (git add --all runs there
-# so the scan covers newly added files).  No need to re-stage here.
-
-if [[ "$DRY_RUN" == "1" ]]; then
-    run git -C "$REPO_DIR" status --short
-    return 0
-fi
-
-if git -C "$REPO_DIR" diff --cached --quiet; then
-    log "No configuration changes to commit"
-
-    # No new changes, but earlier commits may never have reached GitHub
-    # (e.g. a previous push failed after committing, or the remote branch
-    # has not been created yet). Push them now rather than stranding them.
-    if has_unpushed_commits; then
-        log "Local commits have not been pushed yet — pushing now"
-        git -C "$REPO_DIR" push -u origin "$GIT_BRANCH"
-        ok "Changes pushed to GitHub"
-    fi
-
-    return 0
-fi
-
-local computer_name
-local timestamp
-
-computer_name="$(scutil --get ComputerName 2>/dev/null || hostname)"
-timestamp="$(date '+%Y-%m-%d %H:%M:%S %z')"
-
-git -C "$REPO_DIR" commit \
-    -m "Update configuration from ${computer_name} at ${timestamp}"
-
-git -C "$REPO_DIR" push -u origin "$GIT_BRANCH"
-
-log "Changes pushed to GitHub"
-}
 
 # ----
 # Pre-push secret scan
@@ -1828,15 +1629,15 @@ log "Changes pushed to GitHub"
 # configuration, and any newly added managed paths.  The scan stages all
 # pending changes (git add --all), then inspects the staged index
 # (git diff --cached) for common secret material patterns and aborts the
-# push if any are found.  If the scan fails, staged changes are unstaged
-# (git reset) so the push is cleanly aborted without leaving a dirty index.
+# push if any are found. Failed scans retain the proposal for inspection.
+# The cancel command preserves it before resetting the checkout.
 #
 
 # Patterns that strongly indicate secret material when found in file content.
 # Each entry is a grep -E extended regex matched against every staged file.
 SECRET_CONTENT_PATTERNS=(
-    '-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----'
-    '-----BEGIN ENCRYPTED PRIVATE KEY-----'
+    '^-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----'
+    '^-----BEGIN ENCRYPTED PRIVATE KEY-----'
     '"(access_token|refresh_token|client_secret|api_key|apikey|secret_key|private_key)"[[:space:]]*:'
     'AKIA[0-9A-Z]{16}'
     'ghp_[0-9a-zA-Z]{36}'
@@ -1865,259 +1666,421 @@ SECRET_FILENAME_PATTERNS=(
     'service_account\.json$'
 )
 
-scan_for_secrets() {
-    require_repository
 
-    # Stage everything first so that newly added files are included in the
-    # scan.  Without this, git diff --cached would miss files that have
-    # never been tracked before.
-    run git -C "$REPO_DIR" add --all
 
-    step "Scanning staged files for secret material"
-
-    local -i findings=0
-    local pattern relative_path
-
-    local combined_pattern
-    combined_pattern=$(printf '%s\n' "${SECRET_CONTENT_PATTERNS[@]}" | paste -sd'|' -)
-
-    # Enumerate staged files (added, copied, modified, renamed) restricted
-    # to the home/ and machines/ trees so repository-internal files (e.g.
-    # .git/, README.md) are excluded.  NUL-delimited for safe handling of
-    # paths with spaces or special characters.
-    local -a staged_files=()
-    while IFS= read -r -d '' file; do
-        case "$file" in
-            home/*|machines/*) staged_files+=("$file") ;;
-        esac
-    done < <(git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR -z)
-
-    if (( ${#staged_files[@]} == 0 )); then
-        ok "Secret scan passed (no staged files to scan)"
-        return 0
-    fi
-
-    for relative_path in "${staged_files[@]}"; do
-        # Check filename against suspicious patterns
-        for pattern in "${SECRET_FILENAME_PATTERNS[@]}"; do
-            if [[ "$relative_path" =~ $pattern ]]; then
-                warn "Suspicious filename: $relative_path (matches: $pattern)"
-                findings=$((findings + 1))
-                break
-            fi
-        done
-
-        # Stream the staged blob directly from the Git index into grep
-        # rather than capturing it into a Bash variable.  Bash variables
-        # cannot safely represent NUL bytes, so binary blobs would be
-        # silently truncated — corrupting the content scan.
-
-        # Skip binary files.  grep -Iq reads the first buffer and exits
-        # quietly if it finds a NUL byte — unlike the previous MIME-based
-        # check, this correctly treats application/json (and other
-        # structured-text MIME types) as scannable text.
-        if ! git -C "$REPO_DIR" show ":$relative_path" 2>/dev/null |
-            grep -Iq '' 2>/dev/null; then
-            continue
-        fi
-
-        # Use -e to force pattern interpretation — several patterns begin
-        # with '-----BEGIN' whose leading dashes grep otherwise parses as
-        # option flags.
-        if git -C "$REPO_DIR" show ":$relative_path" 2>/dev/null |
-            grep -qE -e "$combined_pattern" 2>/dev/null; then
-            warn "Possible secret content in: $relative_path"
-            # Show which pattern matched (without revealing the secret value)
-            for pattern in "${SECRET_CONTENT_PATTERNS[@]}"; do
-                if git -C "$REPO_DIR" show ":$relative_path" 2>/dev/null |
-                    grep -qE -e "$pattern" 2>/dev/null; then
-                    warn "  matched pattern: $pattern"
-                fi
-            done
-            findings=$((findings + 1))
-        fi
-    done
-
-    if (( findings > 0 )); then
-        echo "" >&2
-        warn "Secret scan found $findings suspicious file(s) in the repository."
-        warn "Review the warnings above. If these are false positives, add"
-        warn "appropriate patterns to EXCLUDE_PATTERNS and re-run push."
-        # Unstage everything so the push is cleanly aborted without leaving
-        # a dirty index that a subsequent push would skip over.
-        git -C "$REPO_DIR" reset --quiet HEAD -- . 2>/dev/null || true
-        die "Aborting push — resolve secret scan findings first."
-    fi
-
-    ok "Secret scan passed (no findings)"
-}
-
-# ----
-# Staleness guard
-# ----
-#
-# Prevents a push from silently overwriting or discarding remote changes
-# that the user has not yet incorporated locally.
-#
-# After rebase, the guard diffs PRE_REBASE_HEAD (old) against the current
-# HEAD (new) to find files the remote changed. For each such file it
-# performs a three-way comparison — local copy vs old blob vs new blob —
-# and classifies the result:
-#
-#   M (modified on remote):
-#     local == old          → stale (user never pulled the update)
-#     local == new          → safe  (user already has the remote version)
-#     local != old != new   → conflict (both sides edited independently)
-#     local missing         → conflict (deleted locally, modified on remote)
-#
-#   A (added on remote):
-#     local missing         → stale (remote addition not yet restored)
-#     local == new          → safe  (user already has the same content)
-#     local != new          → conflict (local file differs from remote add)
-#
-#   D (deleted on remote):
-#     local == old          → stale (pushing would resurrect deleted file)
-#     local != old          → conflict (local edits vs remote deletion)
-#     local missing         → safe  (both sides agree)
-#
-# Any stale or conflicting file aborts the push. The FORCE_PUSH=1 escape
-# hatch bypasses the guard when the user intentionally wants to overwrite.
-
-check_for_unrestored_remote_changes() {
-    require_repository
-
-    if [[ "${FORCE_PUSH:-0}" == "1" ]]; then
-        log "FORCE_PUSH is set — skipping staleness guard"
-        return 0
-    fi
-
-    # PRE_REBASE_HEAD is set by update_from_remote_before_push() just
-    # before the rebase. If it is empty the rebase was skipped (no
-    # remote branch, no commits, or DRY_RUN) — nothing to check.
-    [[ -n "$PRE_REBASE_HEAD" ]] || return 0
-
-    local post_rebase_head
-    post_rebase_head="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || return 0
-
-    # If HEAD did not move, the rebase introduced no remote changes.
-    if [[ "$PRE_REBASE_HEAD" == "$post_rebase_head" ]]; then
-        ok "Staleness guard passed — no remote changes in rebase"
-        return 0
-    fi
-
-    ensure_machine_name
-
-    local -a stale_files=()
-    local status repo_path
-
-    # Enumerate files changed between the old and new HEAD. Only paths
-    # under home/ or this machine's tree are relevant — everything else
-    # (README.md, .gitignore, other machines' trees) is skipped.
-    while IFS=$'\t' read -r status repo_path; do
-        [[ -n "$repo_path" ]] || continue
-
-        local home_relative=""
-        case "$repo_path" in
-            home/*)
-                home_relative="${repo_path#home/}"
-                ;;
-            machines/"$MACHINE"/home/*)
-                home_relative="${repo_path#machines/"$MACHINE"/home/}"
-                ;;
-            *)
-                continue
-                ;;
-        esac
-
-        local local_file
-        local_file="$(local_path "$home_relative")"
-
-        # Reject symlinks at any component between $HOME and the managed
-        # leaf — the content comparisons below follow links, which would
-        # silently proxy the target's content and produce unreliable
-        # staleness results.
-        reject_symlink_components "$HOME" "$home_relative" "~/$home_relative"
-
-        case "$status" in
-            M)
-                # Modified by the remote.
-                if [[ ! -e "$local_file" ]]; then
-                    # File was deleted locally but modified on the remote.
-                    # Pushing would delete the remote version — conflict.
-                    stale_files+=("~/$home_relative (deleted locally, modified on remote)")
-                elif [[ -f "$local_file" ]]; then
-                    # Compare local against the OLD (pre-rebase) blob.
-                    if git -C "$REPO_DIR" show "$PRE_REBASE_HEAD:$repo_path" 2>/dev/null |
-                        cmp -s - "$local_file"; then
-                        # Local == old: user never incorporated the remote
-                        # change — stale.
-                        stale_files+=("~/$home_relative")
-                    elif ! git -C "$REPO_DIR" show "$post_rebase_head:$repo_path" 2>/dev/null |
-                        cmp -s - "$local_file"; then
-                        # Local != old AND local != new: both sides
-                        # changed the file independently — conflict.
-                        stale_files+=("~/$home_relative (conflicting local and remote edits)")
-                    fi
-                    # Local == new: user already has the remote version
-                    # (or made identical edits) — safe to push.
-                fi
-                ;;
-            A)
-                # Added by the remote.
-                if [[ ! -e "$local_file" ]]; then
-                    # File does not exist locally — the remote addition
-                    # has not been restored.
-                    stale_files+=("~/$home_relative (new from remote)")
-                elif [[ -f "$local_file" ]]; then
-                    if ! git -C "$REPO_DIR" show "$post_rebase_head:$repo_path" 2>/dev/null |
-                        cmp -s - "$local_file"; then
-                        # Local file exists but differs from the remote
-                        # addition — conflict.
-                        stale_files+=("~/$home_relative (conflicts with remote addition)")
-                    fi
-                    # Local == new: user already has the same content —
-                    # safe to push.
-                fi
-                ;;
-            D)
-                # Deleted by the remote.
-                if [[ -f "$local_file" ]]; then
-                    if git -C "$REPO_DIR" show "$PRE_REBASE_HEAD:$repo_path" 2>/dev/null |
-                        cmp -s - "$local_file"; then
-                        # Local == old: user never touched the file —
-                        # pushing would silently resurrect it.
-                        stale_files+=("~/$home_relative (deleted on remote)")
-                    else
-                        # Local != old: user edited the file, but the
-                        # remote deleted it — conflict.
-                        stale_files+=("~/$home_relative (edited locally, deleted on remote)")
-                    fi
-                fi
-                # Local file missing: both sides agree on deletion — safe.
-                ;;
-        esac
-    done < <(git -C "$REPO_DIR" diff --no-renames --name-status "$PRE_REBASE_HEAD" "$post_rebase_head" --)
-
-    if (( ${#stale_files[@]} > 0 )); then
-        echo "" >&2
-        warn "The remote contains changes that conflict with the local state."
-        warn "Pushing now would overwrite or discard these remote changes:"
-        local stale_path
-        for stale_path in "${stale_files[@]}"; do
-            warn "  $stale_path"
-        done
-        echo "" >&2
-        warn "Run '$SCRIPT_NAME pull' first to restore the latest versions,"
-        warn "then re-run push. To force this push anyway, set FORCE_PUSH=1."
-        die "Aborting push — unrestored remote changes detected."
-    fi
-
-    ok "Staleness guard passed — local files are up to date with remote changes"
-}
 
 # ----
 # Three-way multi-machine synchronisation
 # ----
+
+# Scan extracted bytes, including binary blobs, without an early-exit pipe.
+# grep status 1 means no match. All other nonzero statuses are fatal errors.
+scan_blob() {
+    local spec="$1" path="$2" blob="$3" pattern rc combined
+    git -C "$REPO_DIR" show "$spec" >"$blob" || die "Cannot extract blob for scanning: $path"
+    for pattern in "${SECRET_FILENAME_PATTERNS[@]}"; do
+        [[ ! "$path" =~ $pattern ]] || die "Suspicious secret filename: $path"
+    done
+    combined="$(printf '%s\n' "${SECRET_CONTENT_PATTERNS[@]}" | paste -sd'|' -)"
+    if grep -aEq -e "$combined" "$blob"; then
+        die "Possible secret in $path. No secret value is printed. Inspect before retrying."
+    else
+        rc=$?
+        [[ "$rc" == 1 ]] || die "Secret scan failed for $path (status $rc)."
+    fi
+}
+
+scan_for_secrets() {
+    git -C "$REPO_DIR" add --all || die "Staging failed."
+    local path dir
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/macos-secret-scan.XXXXXX")"
+    SCAN_TEMP_DIR="$dir"
+    git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR -z >"$dir/paths" || die "Cannot enumerate staged files."
+    while IFS= read -r -d '' path; do
+        case "$path" in home/*|machines/*) scan_blob ":$path" "$path" "$dir/blob" ;; esac
+    done <"$dir/paths"
+    rm -f "$dir/paths" "$dir/blob"
+    rmdir "$dir"
+    SCAN_TEMP_DIR=""
+    ok "Staged secret scan passed"
+}
+
+scan_outgoing_commits() {
+    local dir commit path
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/macos-secret-history.XXXXXX")"
+    SCAN_TEMP_DIR="$dir"
+    git -C "$REPO_DIR" rev-list "origin/$GIT_BRANCH..HEAD" >"$dir/commits" || die "Cannot enumerate outgoing history."
+    # Scan every outgoing commit tree: a secret added and then removed must
+    # still block a push because it would remain in published Git history.
+    while IFS= read -r commit; do
+        git -C "$REPO_DIR" ls-tree -rz --name-only "$commit" >"$dir/paths" || die "Cannot read outgoing tree."
+        while IFS= read -r -d '' path; do
+            case "$path" in home/*|machines/*) scan_blob "$commit:$path" "$path" "$dir/blob" ;; esac
+        done <"$dir/paths"
+    done <"$dir/commits"
+    rm -f "$dir/commits" "$dir/paths" "$dir/blob"
+    rmdir "$dir"
+    SCAN_TEMP_DIR=""
+    ok "Outgoing history secret scan passed"
+}
+
+sync_nas_if_needed() {
+    local receipt="$SYNC_STATE/nas-receipt" expected actual=""
+    expected="$(git -C "$REPO_DIR" rev-parse HEAD)
+$NAS_SSH_HOST
+$NAS_SSH_DIR
+$NAS_RSYNC_PATH
+$NAS_ROOT
+$NAS_REPO_DIR"
+    [[ ! -f "$receipt" ]] || actual="$(<"$receipt")"
+    if [[ "$actual" == "$expected" ]]; then
+        log "NAS mirror already recorded for this commit and destination"
+        return 0
+    fi
+    # Call outside an if context. rsync failures must retain the old receipt.
+    mirror_repository_to_nas
+    if [[ "$NAS_MIRROR_COMPLETE" == 1 ]]; then
+        mkdir -p "$SYNC_STATE"
+        printf '%s\n' "$expected" >"$receipt.tmp"
+        mv "$receipt.tmp" "$receipt"
+    else
+        warn "NAS mirror is pending and will be retried on the next sync."
+    fi
+}
+
+# Private transaction data lives inside .git and never enters GitHub or NAS.
+# Every engine operation is a top-level command whose failure must propagate.
+# Python performs byte comparisons, strict path validation and atomic writes.
+sync_files() {
+    python3 - "$1" "$HOME" "$REPO_DIR" "$MACHINE" "$AUTO_ADD" "${2:-}" \
+        --shared-files "${MANAGED_FILES[@]}" \
+        --shared-dirs "${MANAGED_DIRECTORIES[@]}" \
+        --machine-files "${MACHINE_FILES[@]}" \
+        --machine-dirs "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}" \
+        --excludes "${EXCLUDE_PATTERNS[@]}" <<'PY'
+import argparse, fnmatch, hashlib, json, os, pathlib, shutil, stat, subprocess, sys, tempfile
+
+p = argparse.ArgumentParser()
+for name in ('action', 'home', 'repo', 'machine', 'auto', 'value'):
+    p.add_argument(name)
+for name in ('shared-files', 'shared-dirs', 'machine-files', 'machine-dirs', 'excludes'):
+    p.add_argument('--' + name, nargs='*', default=[])
+a = p.parse_args()
+home, repo = pathlib.Path(a.home), pathlib.Path(a.repo)
+state = repo / '.git' / ('macos-config-sync-v31-' + a.machine)
+registry_path = state / 'ownership.json'
+manifest_path = state / 'pending.json'
+
+def git(*args):
+    return subprocess.check_output(['git', '-C', str(repo), *args])
+
+def valid(s):
+    if not s or s.startswith('/') or any(x in ('', '.', '..', '.git') for x in s.split('/')) or any(ord(x) < 32 for x in s):
+        raise RuntimeError('Unsafe or unsupported path: ' + repr(s))
+    return s
+
+def safe(root, s):
+    valid(s)
+    current = root
+    if root.is_symlink():
+        raise RuntimeError('Symlink root: ' + str(root))
+    for part in s.split('/'):
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError('Symlink not supported: ' + str(current))
+    return current
+
+def save(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.state-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def read(path, default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+def digest(path):
+    if not path.exists(): return None
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError('Expected regular file: ' + str(path))
+    with path.open('rb') as f:
+        h = hashlib.sha256()
+        for b in iter(lambda: f.read(1024 * 1024), b''): h.update(b)
+        return h.hexdigest()
+
+prefix = 'machines/' + a.machine + '/home/'
+def mapping(s):
+    valid(s)
+    for files, dirs, root in ((a.shared_files, a.shared_dirs, 'home/'),
+                              (a.machine_files, a.machine_dirs, prefix)):
+        if s in files or any(s.startswith(d + '/') for d in dirs): return root + s
+    return None
+
+def unmap(s):
+    for root in ('home/', prefix):
+        if s.startswith(root):
+            h = s[len(root):]
+            return h if mapping(h) == s else None
+    return None
+
+ownership = read(registry_path, {'add': [], 'forget': []})
+def excluded(s):
+    parts = s.split('/')
+    if s in ownership['forget']: return True
+    if '.git' in parts: return True
+    for pat in a.excludes:
+        if pat.endswith('/'):
+            if any(fnmatch.fnmatchcase(x, pat[:-1]) for x in parts[:-1]): return True
+        elif any(fnmatch.fnmatchcase(x, pat) for x in parts): return True
+    return False
+
+config = [a.shared_files, a.shared_dirs, a.machine_files, a.machine_dirs,
+          a.excludes, ownership, a.auto, str(home), str(repo), a.machine]
+
+def inventory():
+    result = {}
+    for s in a.shared_files + a.machine_files:
+        if not excluded(s):
+            path = safe(home, s)
+            if path.exists(): result[s] = digest(path)
+    def walk(directory):
+        for path in sorted(directory.iterdir()):
+            s = str(path.relative_to(home))
+            if excluded(s + ('/' if path.is_dir() else '')): continue
+            safe(home, s)
+            if path.is_dir(): walk(path)
+            else: result[s] = digest(path)
+    for s in a.shared_dirs + a.machine_dirs:
+        path = safe(home, s)
+        if path.exists():
+            if not path.is_dir(): raise RuntimeError('Expected directory: ' + str(path))
+            walk(path)
+    return result
+
+def tracked(commit):
+    result = {}
+    data = git('ls-tree', '-rz', '--full-tree', commit)
+    for entry in data.split(b'\0'):
+        if not entry: continue
+        meta, raw = entry.split(b'\t', 1)
+        mode, kind, oid = meta.decode().split()
+        s = os.fsdecode(raw)
+        h = unmap(s)
+        if h is None or excluded(h): continue
+        if mode not in ('100644', '100755') or kind != 'blob':
+            raise RuntimeError('Unsupported Git file type: ' + s)
+        result[h] = s
+    return result
+
+def load_manifest():
+    m = read(manifest_path, None)
+    if m is None: raise RuntimeError('Missing transaction snapshot')
+    if m['config'] != config:
+        raise RuntimeError('Configuration or ownership changed during pending sync. Restore the previous settings before resuming.')
+    return m
+
+def check(m):
+    now = inventory()
+    for s in sorted(set(now) | set(m['home']) | set(m.get('desired', {}))):
+        allowed = [m['home'].get(s)]
+        if m['phase'] == 'deploying' and s in m.get('desired', {}):
+            allowed.append(m['desired'][s])
+        elif m['phase'] == 'deployed' and s in m.get('desired', {}):
+            allowed = [m['desired'][s]]
+        if now.get(s) not in allowed:
+            raise RuntimeError('HOME changed after capture: ~/' + s +
+                '. Sync stopped without overwriting this edit. Preserve it separately and reconcile it with the saved transaction before retrying.')
+
+try:
+    # .git is intentionally excluded from general managed paths. Validate the
+    # state directory separately before using it for private transaction data.
+    if (repo / '.git').is_symlink() or state.is_symlink():
+        raise RuntimeError('Symlink transaction directory is not supported')
+    if a.action in ('add', 'forget'):
+        if manifest_path.exists(): raise RuntimeError('Finish the pending sync before changing ownership')
+        s = valid(a.value)
+        if not mapping(s): raise RuntimeError('Path is outside configured managed paths: ' + s)
+        safe(home, s)
+        if a.action == 'add':
+            ownership['forget'] = [x for x in ownership['forget'] if x != s]
+            if excluded(s): raise RuntimeError('Path matches a credential/cache exclusion: ' + s)
+            if not (home / s).is_file(): raise RuntimeError('Add requires an existing regular file')
+            ownership['add'] = sorted(set(ownership['add'] + [s]))
+        else:
+            ownership['add'] = [x for x in ownership['add'] if x != s]
+            ownership['forget'] = sorted(set(ownership['forget'] + [s]))
+        save(registry_path, ownership)
+        print(a.action.upper() + ': ~/' + s + ' (takes effect on next sync)')
+    elif a.action == 'snapshot':
+        if manifest_path.exists(): raise RuntimeError('A sync is already pending')
+        save(manifest_path, {'base': a.value, 'home': inventory(), 'config': config,
+                            'phase': 'captured', 'desired': {}})
+    elif a.action == 'collect':
+        m = load_manifest()
+        check(m)
+        known = tracked(m['base'])
+        selected = set(known) | set(a.shared_files + a.machine_files) | set(ownership['add'])
+        if a.auto == '1': selected |= set(m['home'])
+        for s in sorted(selected):
+            if excluded(s): continue
+            dest = safe(repo, mapping(s))
+            source = safe(home, s)
+            generated = state / 'generated' / s
+            if s in a.machine_files and generated.is_file(): source = generated
+            if source.exists():
+                if digest(source) != digest(dest):
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, dest)
+            elif dest.exists():
+                if not dest.is_file(): raise RuntimeError('Refusing directory removal: ' + str(dest))
+                dest.unlink()
+        # Forget removes the repository copy only. The HOME file is local-only.
+        for s in ownership['forget']:
+            dest = safe(repo, mapping(s))
+            if dest.exists():
+                if not dest.is_file(): raise RuntimeError('Forget requires a file: ' + s)
+                dest.unlink()
+        for s in sorted(set(m['home']) - selected): print('LOCAL-ONLY: ~/' + s + ' (use add to enrol)')
+        check(m)
+    elif a.action == 'check':
+        check(load_manifest())
+    elif a.action == 'plan':
+        m = load_manifest()
+        check(m)
+        target = git('rev-parse', 'HEAD').decode().strip()
+        if m['phase'] in ('deploying', 'deployed'):
+            if m['target'] != target: raise RuntimeError('Target changed during partial deployment')
+        else:
+            files = tracked(target)
+            basefiles = tracked(m['base'])
+            localfiles = tracked(m.get('local', m['base']))
+            desired = {}
+            for s in sorted(set(files) | set(basefiles)):
+                new = digest(safe(repo, files[s])) if s in files else None
+                if s in files and new is None: raise RuntimeError('Missing target file: ' + s)
+                if s not in localfiles and s in m['home'] and m['home'][s] != new:
+                    raise RuntimeError('Remote addition conflicts with local-only file: ~/' + s)
+                desired[s] = new
+            m.update(desired=desired, target=target)
+            save(manifest_path, m)
+    elif a.action == 'local':
+        m = load_manifest()
+        m['local'] = git('rev-parse', 'HEAD').decode().strip()
+        git('update-ref', 'refs/macos-config-sync/' + a.machine + '/pending-local', m['local'])
+        save(manifest_path, m)
+    elif a.action == 'deploy':
+        m = load_manifest()
+        check(m)
+        if m['target'] != git('rev-parse', 'HEAD').decode().strip(): raise RuntimeError('Target changed')
+        m['phase'] = 'deploying'
+        save(manifest_path, m)
+        for s, wanted in sorted(m['desired'].items()):
+            dest = safe(home, s)
+            actual = digest(dest)
+            if actual == wanted: continue
+            if actual != m['home'].get(s): raise RuntimeError('Concurrent HOME edit: ~/' + s)
+            if wanted is None:
+                dest.unlink()
+                print('DELETED (backed up): ~/' + s)
+            else:
+                source = safe(repo, mapping(s))
+                if digest(source) != wanted: raise RuntimeError('Target content changed: ' + s)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix='.config-sync-', dir=dest.parent)
+                os.close(fd)
+                try:
+                    shutil.copy2(source, tmp)
+                    if digest(pathlib.Path(tmp)) != wanted: raise RuntimeError('Copy checksum mismatch: ' + s)
+                    safe(home, s)
+                    if digest(dest) != actual: raise RuntimeError('Concurrent HOME edit: ~/' + s)
+                    os.replace(tmp, dest)
+                finally:
+                    if os.path.exists(tmp): os.unlink(tmp)
+        check(m)
+        m['phase'] = 'deployed'
+        save(manifest_path, m)
+    elif a.action == 'phase':
+        print(load_manifest()['phase'])
+    elif a.action == 'needs-deploy':
+        m = load_manifest()
+        print('yes' if any(m['home'].get(s) != value for s, value in m['desired'].items()) else 'no')
+    elif a.action == 'base':
+        print(load_manifest()['base'])
+    elif a.action == 'clear':
+        git('update-ref', '-d', 'refs/macos-config-sync/' + a.machine + '/pending-local')
+        manifest_path.unlink()
+    else:
+        raise RuntimeError('Unknown manifest operation')
+except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
+    print('ERROR: ' + str(e), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+setup_sync_state() {
+    SYNC_STATE="$REPO_DIR/.git/macos-config-sync-v31-$MACHINE"
+    [[ ! -L "$REPO_DIR/.git" && ! -L "$SYNC_STATE" ]] || die "Symlink sync state is not supported."
+}
+
+deployed_ref() { printf 'refs/macos-config-sync/%s/deployed\n' "$MACHINE"; }
+
+record_deployed_baseline() {
+    run git -C "$REPO_DIR" update-ref "$(deployed_ref)" HEAD
+}
+
+adopt_baseline() {
+    validate_dependencies
+    validate_configuration
+    require_repository
+    setup_sync_state
+    [[ ! -f "$SYNC_STATE/pending.json" ]] || die "A sync is pending. Finish it before adoption."
+    [[ ! -f "$REPO_DIR/.git/macos-config-sync-pending-base" ]] || die "Finish or explicitly abandon the v3.0 pending operation first."
+    repository_is_clean || die "Inspect and commit or preserve repository changes before adoption."
+    repository_has_commits || die "Empty repository: initialise its first commit before adoption."
+    [[ "$(git -C "$REPO_DIR" symbolic-ref --short HEAD)" == "$GIT_BRANCH" ]] || die "Wrong branch."
+    record_deployed_baseline
+    log "Adopted the current checkout as the last deployed baseline for $MACHINE."
+    log "No HOME files were changed. Subsequent sync will compare local edits against this baseline."
+}
+
+fetch_sync_remote() {
+    # An authentication/network failure is not evidence that a branch is absent.
+    local refs
+    refs="$(git -C "$REPO_DIR" ls-remote --heads origin "refs/heads/$GIT_BRANCH")" || die "Unable to inspect remote branch."
+    [[ -n "$refs" ]] || die "Remote branch is missing. Initialise it explicitly before sync."
+    git -C "$REPO_DIR" fetch origin "refs/heads/$GIT_BRANCH:refs/remotes/origin/$GIT_BRANCH" || die "Fetch failed."
+}
+
+cancel_sync() {
+    validate_dependencies
+    validate_configuration
+    require_repository
+    setup_sync_state
+    [[ -f "$SYNC_STATE/pending.json" ]] || die "No v3.1 sync to cancel."
+    local base stamp rescue
+    base="$(sync_files base)" || die "Cannot read transaction baseline."
+    stamp="$(date '+%Y%m%d-%H%M%S')-$$"
+    rescue="refs/macos-config-sync/$MACHINE/cancelled-$stamp"
+    # Explicit cancel authorises resetting the private checkout, never HOME.
+    # Preserve commits AND uncommitted files before any reset. Fail closed if
+    # preservation fails. Archived manifests retain the original HOME hashes.
+    git -C "$REPO_DIR" update-ref "$rescue" HEAD || die "Cannot preserve pending commit."
+    if [[ -d "$REPO_DIR/.git/rebase-merge" || -d "$REPO_DIR/.git/rebase-apply" ]]; then
+        [[ -z "$(git -C "$REPO_DIR" diff --name-only --diff-filter=U)" ]] || die "Unresolved rebase: preserve your conflict edits and abort or finish it manually before cancel."
+        die "Finish or abort the active rebase manually before cancel."
+    fi
+    git -C "$REPO_DIR" stash push --include-untracked -m "macos-config-sync cancelled $stamp" || die "Cannot preserve uncommitted proposal."
+    git -C "$REPO_DIR" reset --hard "$base" || die "Cannot restore checkout baseline."
+    mv "$SYNC_STATE/pending.json" "$SYNC_STATE/cancelled-$stamp.json"
+    warn "Cancelled checkout changes are recoverable in $rescue and Git stash (if changes existed)."
+    log "HOME was not changed. Run sync to capture its current state again."
+}
 
 repository_path_to_home_path() {
     local repo_path="$1"
@@ -2148,18 +2111,20 @@ list_managed_deletions() {
 
     local repo_path
     local home_relative
+    local dir
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/macos-deletions.XXXXXX")"
 
     if [[ "$comparison" == "cached" ]]; then
-        while IFS= read -r -d '' repo_path; do
-            home_relative="$(repository_path_to_home_path "$repo_path")" || continue
-            printf '%s\n' "$home_relative"
-        done < <(git -C "$REPO_DIR" diff --cached --diff-filter=D --name-only -z --)
+        git -C "$REPO_DIR" diff --cached --no-renames --diff-filter=D --name-only -z -- >"$dir/paths" || die "Cannot enumerate local deletions."
     else
-        while IFS= read -r -d '' repo_path; do
-            home_relative="$(repository_path_to_home_path "$repo_path")" || continue
-            printf '%s\n' "$home_relative"
-        done < <(git -C "$REPO_DIR" diff --diff-filter=D --name-only -z "$@" --)
+        git -C "$REPO_DIR" diff --no-renames --diff-filter=D --name-only -z "$@" -- >"$dir/paths" || die "Cannot enumerate reconciled deletions."
     fi
+    while IFS= read -r -d '' repo_path; do
+        home_relative="$(repository_path_to_home_path "$repo_path")" || continue
+        printf '%s\n' "$home_relative"
+    done <"$dir/paths"
+    rm -f "$dir/paths"
+    rmdir "$dir"
 }
 
 confirm_deletions() {
@@ -2209,19 +2174,6 @@ confirm_deletions() {
     esac
 }
 
-reset_uncommitted_snapshot() {
-    local base_commit="$1"
-
-    [[ "$DRY_RUN" == "1" ]] && return 0
-
-    if [[ -n "$base_commit" ]]; then
-        git -C "$REPO_DIR" reset --hard "$base_commit" >/dev/null
-    else
-        git -C "$REPO_DIR" reset --hard >/dev/null 2>&1 || true
-    fi
-
-    git -C "$REPO_DIR" clean -fd >/dev/null
-}
 
 commit_local_snapshot() {
     if [[ "$DRY_RUN" == "1" ]]; then
@@ -2246,45 +2198,6 @@ commit_local_snapshot() {
     ok "Local configuration snapshot committed"
 }
 
-sync_directory_without_delete() {
-    local source_dir="$1"
-    local destination_dir="$2"
-    shift 2
-
-    [[ -d "$source_dir" ]] || return 0
-
-    run mkdir -p "$destination_dir"
-    run rsync \
-        "${COMMON_RSYNC_OPTIONS[@]}" \
-        "$@" \
-        "$source_dir/" \
-        "$destination_dir/"
-}
-
-apply_reconciled_deletions() {
-    local base_commit="$1"
-    local repo_path
-    local home_relative
-    local destination
-
-    [[ -n "$base_commit" ]] || return 0
-
-    while IFS= read -r -d '' repo_path; do
-        home_relative="$(repository_path_to_home_path "$repo_path")" || continue
-        destination="$(local_path "$home_relative")"
-
-        reject_symlink_components "$HOME" "$home_relative" "~/$home_relative"
-
-        if [[ -d "$destination" ]]; then
-            die "Refusing to remove a directory for a Git file deletion: $destination"
-        fi
-
-        if [[ -e "$destination" || -L "$destination" ]]; then
-            log "Removing reconciled deletion: ~/$home_relative"
-            run rm -f "$destination"
-        fi
-    done < <(git -C "$REPO_DIR" diff --diff-filter=D --name-only -z "$base_commit" HEAD --)
-}
 
 apply_local_permissions() {
     if [[ -d "$HOME/scripts" ]]; then
@@ -2304,77 +2217,6 @@ apply_local_permissions() {
     fi
 }
 
-deploy_reconciled_files() {
-    local base_commit="$1"
-    local path
-
-    step "Applying reconciled configuration to the Mac"
-
-    for path in "${MANAGED_DIRECTORIES[@]}"; do
-        reject_symlink_components "$HOME" "$path" "~/$path"
-        reject_symlink_components "$REPO_DIR" "home/$path" "repo:home/$path"
-        reject_symlinks_in_directory "$(repository_path "$path")" "repo:home/$path"
-    done
-
-    for path in "${MANAGED_FILES[@]}"; do
-        reject_symlink_components "$HOME" "$path" "~/$path"
-        reject_symlink_components "$REPO_DIR" "home/$path" "repo:home/$path"
-    done
-
-    for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
-        reject_symlink_components "$HOME" "$path" "~/$path"
-        reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo:machines/$MACHINE/home/$path"
-        reject_symlinks_in_directory "$(machine_repository_path "$path")" "repo:machines/$MACHINE/home/$path"
-    done
-
-    for path in "${MACHINE_FILES[@]}"; do
-        reject_symlink_components "$HOME" "$path" "~/$path"
-        reject_symlink_components "$REPO_DIR" "machines/$MACHINE/home/$path" "repo:machines/$MACHINE/home/$path"
-    done
-
-    create_local_backup
-
-    for path in "${MANAGED_DIRECTORIES[@]}"; do
-        log "Updating ~/$path without deleting local untracked files"
-        sync_directory_without_delete \
-            "$(repository_path "$path")" \
-            "$(local_path "$path")" \
-            "${DIRECTORY_EXCLUDES[@]}" \
-            --exclude='.git/'
-    done
-
-    for path in "${MANAGED_FILES[@]}"; do
-        if [[ -f "$(repository_path "$path")" ]]; then
-            log "Updating ~/$path"
-            sync_file "$(repository_path "$path")" "$(local_path "$path")"
-        fi
-    done
-
-    for path in "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
-        if [[ -d "$(machine_repository_path "$path")" ]]; then
-            log "Updating ~/$path without deleting local untracked files (machine: $MACHINE)"
-            sync_directory_without_delete \
-                "$(machine_repository_path "$path")" \
-                "$(local_path "$path")" \
-                "${DIRECTORY_EXCLUDES[@]}" \
-                --exclude='.git/'
-        fi
-    done
-
-    for path in "${MACHINE_FILES[@]}"; do
-        if [[ -f "$(machine_repository_path "$path")" ]]; then
-            log "Updating ~/$path (machine: $MACHINE)"
-            sync_file "$(machine_repository_path "$path")" "$(local_path "$path")"
-        fi
-    done
-
-    apply_reconciled_deletions "$base_commit"
-    apply_local_permissions
-    restore_moom_preferences
-    prune_local_backups
-
-    ok "Reconciled configuration applied"
-}
 
 show_rebase_conflicts() {
     local repo_path
@@ -2404,8 +2246,10 @@ Then run:
 
 To abandon the reconciliation:
   git -C "$REPO_DIR" rebase --abort
-  rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
-  rm -f "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
+  $SCRIPT_NAME cancel
+
+Do not edit managed HOME files while resolving the repository conflict.
+If you already have, sync will stop and preserve those edits.
 EOF
 }
 
@@ -2414,17 +2258,21 @@ finish_reconciled_sync() {
     local temp_dir="$2"
     local final_deletions="$temp_dir/final-deletions"
     local pending_deletions="$temp_dir/pending-deletions"
-    local accepted_deletions="$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
+    local accepted_deletions="$SYNC_STATE/accepted-deletions"
     local final_commit=""
+
+    sync_files check || die "HOME verification failed. Transaction retained."
+    sync_files plan || die "Deployment preflight failed. Nothing pushed."
+    scan_outgoing_commits
 
     if [[ "$DRY_RUN" != "1" && -n "$base_commit" ]]; then
         final_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
 
-        if [[ "$final_commit" == "$base_commit" ]] && ! has_unpushed_commits; then
-            rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
-            rm -f "$accepted_deletions"
+        if [[ "$final_commit" == "$base_commit" && "$(sync_files needs-deploy)" == no ]] && ! has_unpushed_commits; then
+            sync_files clear
             ok "No configuration changes detected"
-            log "Skipping local backup, deployment, Moom import and NAS mirror"
+            log "Skipping local backup, deployment and Moom import"
+            sync_nas_if_needed
             return 0
         fi
     fi
@@ -2445,39 +2293,44 @@ finish_reconciled_sync() {
         die "Sync stopped. No reconciled files were applied to HOME or pushed."
     fi
 
-    commit_and_push
-    deploy_reconciled_files "$base_commit"
-    run rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
-    run rm -f "$accepted_deletions"
-    mirror_repository_to_nas
+    sync_files check || die "HOME changed before push. Transaction retained."
+    git -C "$REPO_DIR" push -u origin "HEAD:refs/heads/$GIT_BRANCH" || die "Push failed. Deployment has not started."
+    sync_files check || die "HOME changed during push. Deployment stopped."
+    create_local_backup
+    sync_files check || die "HOME changed during backup. Deployment stopped."
+    sync_files deploy || die "Deployment stopped. Snapshot and backup retained for recovery."
+    apply_local_permissions
+    restore_moom_preferences
+    sync_files check || die "HOME changed before completion. Transaction retained."
+    record_deployed_baseline
+    sync_files clear
+    prune_local_backups
+    sync_nas_if_needed
 
     ok "Synchronisation complete"
 }
 
 resume_reconciled_sync() {
-    local pending_file="$REPO_DIR/.git/macos-config-sync-pending-base"
     local base_commit
     local temp_dir="$1"
-
-    [[ -f "$pending_file" ]] || return 1
-
+    local phase
+    [[ ! -d "$REPO_DIR/.git/rebase-merge" && ! -d "$REPO_DIR/.git/rebase-apply" ]] || die "Rebase is still active. Resolve it and run git rebase --continue first."
+    [[ "$(git -C "$REPO_DIR" symbolic-ref --short HEAD)" == "$GIT_BRANCH" ]] || die "Cannot resume from another branch."
+    sync_files check || die "HOME no longer matches the captured transaction. No deployment performed."
     if ! repository_is_clean; then
-        warn "A previous sync is waiting for Git conflict resolution."
-        show_rebase_conflicts
-        exit 1
+        die "Pending proposal has uncommitted changes. Inspect/resolve and commit it, or use '$SCRIPT_NAME cancel' to preserve it and start again."
     fi
 
-    base_commit="$(sed -n '1p' "$pending_file")"
-    [[ -n "$base_commit" ]] || die "Pending sync marker is invalid: $pending_file"
+    base_commit="$(sync_files base)" || die "Cannot read pending baseline."
     git -C "$REPO_DIR" cat-file -e "${base_commit}^{commit}" 2>/dev/null ||
         die "Pending sync base commit is unavailable: $base_commit"
 
     step "Resuming the previously reconciled sync"
 
-    if remote_branch_exists; then
-        run git -C "$REPO_DIR" fetch origin "$GIT_BRANCH"
-        if [[ "$DRY_RUN" != "1" ]] &&
-           ! git -C "$REPO_DIR" merge-base --is-ancestor "origin/$GIT_BRANCH" HEAD; then
+    phase="$(sync_files phase)" || die "Cannot read pending phase."
+    fetch_sync_remote
+    if [[ "$phase" == "captured" ]]; then
+        if ! git -C "$REPO_DIR" merge-base --is-ancestor "origin/$GIT_BRANCH" HEAD; then
             if ! git -C "$REPO_DIR" rebase "origin/$GIT_BRANCH"; then
                 show_rebase_conflicts
                 exit 1
@@ -2499,7 +2352,12 @@ sync_configuration() {
     local temp_dir
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/macos-config-sync.XXXXXX")"
 
-    if resume_reconciled_sync "$temp_dir"; then
+    # Never invoke this function as an if-condition: that suppresses errexit
+    # and ERR in every nested command, including push, backup and deployment.
+    setup_sync_state
+    [[ ! -f "$REPO_DIR/.git/macos-config-sync-pending-base" ]] || die "Legacy v3.0 recovery state found. Preserve both HOME and repository and finish that operation before upgrading."
+    if [[ -f "$SYNC_STATE/pending.json" ]]; then
+        resume_reconciled_sync "$temp_dir"
         rm -rf "$temp_dir"
         return 0
     fi
@@ -2507,39 +2365,37 @@ sync_configuration() {
     repository_is_clean ||
         die "The local repository contains uncommitted changes. Inspect $REPO_DIR before syncing."
 
-    local base_commit=""
-    if repository_has_commits; then
-        base_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
-    fi
+    local base_commit
+    base_commit="$(git -C "$REPO_DIR" rev-parse --verify "$(deployed_ref)")" || die "No deployed baseline. For an existing installation inspect the checkout then run '$SCRIPT_NAME adopt'. For a new Mac use an explicit restore."
+    [[ "$(git -C "$REPO_DIR" symbolic-ref --short HEAD)" == "$GIT_BRANCH" ]] || die "Wrong branch or detached HEAD."
+    [[ "$(git -C "$REPO_DIR" rev-parse HEAD)" == "$base_commit" ]] || die "Checkout differs from the last deployed baseline. Preserve and inspect those changes. Do not adopt them unless they really were applied to HOME."
 
     step "Capturing local configuration before contacting GitHub"
+    sync_files snapshot "$base_commit"
+    mkdir -p "$SYNC_STATE/generated"
+    # Remove only known generated staging files from an earlier completed run.
+    rm -f "$SYNC_STATE/generated/Brewfile" "$SYNC_STATE/generated/installed-apps.txt" "$SYNC_STATE/generated/Moom.plist"
+    GENERATED_ROOT="$SYNC_STATE/generated"
     generate_brewfile
     generate_installed_apps_list
     export_moom_preferences
-    collect_local_files
-    prune_unmanaged_repository_paths
-    prune_unmanaged_machine_paths
+    GENERATED_ROOT=""
+    sync_files collect
     create_repository_files
     scan_for_secrets
 
     local local_deletions="$temp_dir/local-deletions"
     list_managed_deletions cached >"$local_deletions"
     if ! confirm_deletions "$local_deletions" "Local deletions to propagate"; then
-        reset_uncommitted_snapshot "$base_commit"
-        rm -rf "$temp_dir"
-        die "Sync cancelled. The repository was restored and HOME was not changed."
+        die "Deletion not accepted. HOME is unchanged. The staged proposal and snapshot are retained for inspection."
     fi
+    cp "$local_deletions" "$SYNC_STATE/accepted-deletions"
 
     commit_local_snapshot
-
-    if [[ "$DRY_RUN" != "1" && -n "$base_commit" ]]; then
-        cp "$local_deletions" "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
-        printf '%s\n' "$base_commit" >"$REPO_DIR/.git/macos-config-sync-pending-base"
-    fi
-
-    if remote_branch_exists; then
+    sync_files local
+    if [[ "$DRY_RUN" != "1" ]]; then
         step "Fetching current remote branch"
-        run git -C "$REPO_DIR" fetch origin "$GIT_BRANCH"
+        fetch_sync_remote
 
         if [[ "$DRY_RUN" != "1" ]]; then
             step "Reconciling local and remote commits"
@@ -2549,8 +2405,6 @@ sync_configuration() {
                 exit 1
             fi
         fi
-    else
-        log "Remote branch does not yet exist: $GIT_BRANCH"
     fi
 
     finish_reconciled_sync "$base_commit" "$temp_dir"
@@ -2569,7 +2423,7 @@ create_local_backup() {
 local backup_dir
 local path
 
-backup_dir="$BACKUP_ROOT/$(date '+%Y%m%d_%H%M%S')"
+    backup_dir="$BACKUP_ROOT/$(date '+%Y%m%d_%H%M%S')_$$"
 
 step "Creating local backup: $backup_dir"
 
@@ -2800,6 +2654,8 @@ validate_dependencies
 validate_configuration
 require_repository
 show_tool_versions
+setup_sync_state
+[[ ! -f "$SYNC_STATE/pending.json" ]] || die "Finish or cancel the pending sync before a destructive pull."
 
 repository_is_clean ||
     die "The local repository contains uncommitted changes. Run push or inspect the repository first."
@@ -2814,9 +2670,10 @@ run git -C "$REPO_DIR" checkout "$GIT_BRANCH"
 run git -C "$REPO_DIR" pull --ff-only origin "$GIT_BRANCH"
 
 restore_local_files
+record_deployed_baseline
 run rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
 run rm -f "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
-mirror_repository_to_nas
+sync_nas_if_needed
 }
 
 # ----
@@ -2834,9 +2691,14 @@ validate_dependencies
 validate_configuration
 require_repository
 show_tool_versions
+setup_sync_state
+[[ ! -f "$SYNC_STATE/pending.json" ]] || die "Finish or cancel the pending sync before restore."
+repository_is_clean || die "Restore requires a clean committed checkout."
+[[ "$(git -C "$REPO_DIR" symbolic-ref --short HEAD)" == "$GIT_BRANCH" ]] || die "Wrong restore branch."
 
 step "Restoring configuration from local repository (no remote contact)"
 restore_local_files
+record_deployed_baseline
 run rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
 run rm -f "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
 }
@@ -2846,6 +2708,7 @@ run rm -f "$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
 # ----
 mirror_repository_to_nas() {
 require_repository
+NAS_MIRROR_COMPLETE=0
 
 # --delete-excluded removes excluded paths (such as a pre-existing .git
 # directory) from the NAS mirror. --delete alone protects excluded paths.
@@ -2886,6 +2749,7 @@ if [[ "$nas_transport" == "ssh" ]]; then
         "$NAS_SSH_HOST:$NAS_SSH_DIR/"
 
     ok "NAS mirror updated (SSH)"
+    NAS_MIRROR_COMPLETE=1
 elif [[ "$nas_transport" == "smb" ]]; then
     step "Mirroring repository files to NAS via SMB: $NAS_REPO_DIR"
 
@@ -2901,6 +2765,7 @@ elif [[ "$nas_transport" == "smb" ]]; then
         "$NAS_REPO_DIR/"
 
     ok "NAS mirror updated (SMB)"
+    NAS_MIRROR_COMPLETE=1
 else
     warn "NAS is unreachable (SSH host: $NAS_SSH_HOST, SMB mount: $NAS_ROOT)"
     warn "The GitHub operation completed, but the NAS mirror was not updated."
@@ -3087,8 +2952,24 @@ main() {
 local command="${1:-help}"
 local requires_lock=0
 
+# A dry-run is a read-only explanation, not a partial transaction. In
+# particular it must not prune empty directories or rewrite state receipts.
+if [[ "$DRY_RUN" == 1 ]]; then
+    case "$command" in
+        help|--help|-h|version|--version|-V|status) ;;
+        *)
+            validate_dependencies
+            validate_configuration
+            log "DRY-RUN: $command would inspect local files and the remote, then propose changes."
+            log "No generation, fetch, staging, pruning, backup, deployment or state writes performed."
+            log "This is not a computed remote diff. Run normally for the actual reconciliation and deletion prompts."
+            return 0
+            ;;
+    esac
+fi
+
 case "$command" in
-    init | sync | push | pull | restore | nas-push | nas-pull)
+    init | sync | push | pull | restore | nas-push | nas-pull | adopt | add | forget | cancel)
         requires_lock=1
         ;;
 esac
@@ -3099,6 +2980,20 @@ if (( requires_lock == 1 )); then
 fi
 
 case "$command" in
+    adopt)
+        adopt_baseline
+        ;;
+    add|forget)
+        validate_dependencies
+        validate_configuration
+        require_repository
+        setup_sync_state
+        [[ $# == 2 ]] || die "Usage: $SCRIPT_NAME $command HOME-relative-file"
+        sync_files "$command" "$2"
+        ;;
+    cancel)
+        cancel_sync
+        ;;
     init)
         initialise_repository
         ;;
@@ -3140,4 +3035,6 @@ case "$command" in
 esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

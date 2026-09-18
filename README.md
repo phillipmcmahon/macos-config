@@ -32,7 +32,32 @@ Stored beneath `machines/<machine-name>/home` and restored only on the machine w
 - `~/installed-apps.txt`
 - `~/Moom.plist`
 
-Caches, logs and known credential files (for example `hosts.yml`, `rclone.conf`, `*.token`, `*.key`) are excluded from directory syncs via `EXCLUDE_PATTERNS` in `macos-config-sync.sh`. Add any experimental or deliberately local-only filename pattern there so it is neither collected nor removed by routine sync.
+Caches, logs and known credential files are excluded via `EXCLUDE_PATTERNS`.
+New files inside managed directories are local-only by default. Enrol one with
+`macos-config-sync.sh add scripts/example.sh`, then run `sync`.
+`forget scripts/example.sh` keeps this Mac's local file and proposes deleting
+the repository copy. Other Macs will see that deletion. `AUTO_ADD=1` explicitly
+enables the older automatic-enrolment behaviour. Individual configured files
+are always managed unless forgotten or excluded.
+
+## Baseline and recovery
+
+After upgrading an already-synchronised Mac, inspect the checkout and run
+`macos-config-sync.sh adopt` once. This explicitly trusts it as the last deployed
+state. Fresh Macs should use deliberate `pull` or `restore` instead.
+Python 3 is required. Pending transactions check SHA-256 HOME snapshots before
+deploying and stop if newer local edits exist. Resolve rebase conflicts inside
+the repository and run `git rebase --continue`, then `sync`.
+To abandon a proposal, abort any active rebase first and run `cancel`. It
+preserves commits and uncommitted changes before resetting the private checkout,
+and never changes HOME. Cancel is not a rollback of an already published commit.
+Avoid editing managed HOME files during deployment. Each replacement is atomic,
+but the collection of files is not a filesystem-wide atomic transaction.
+
+A no-change run skips backup and deployment, but retries an outstanding NAS
+mirror. NAS completion is tracked separately from Git completion.
+`DRY_RUN=1` prints an operation explanation without mutating files or fetching.
+It is not a computed reconciliation preview.
 
 ## Restore
 
