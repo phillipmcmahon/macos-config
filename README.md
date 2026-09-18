@@ -7,6 +7,7 @@ Private repository containing selected macOS configuration, scripts and Homebrew
 Stored beneath the repository's `home` directory and restored on every machine.
 
 - `~/.config/.zsh_functions`
+- `~/.config/cloudns/hosts.txt`
 - `~/.config/topgrade.toml`
 - `~/.gitconfig`
 - `~/.gnupg/gpg-agent.conf`

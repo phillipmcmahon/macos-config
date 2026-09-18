@@ -1,0 +1,15 @@
+# S3
+*.s3
+s3
+
+# Media
+emby
+jellyfin
+music
+
+# Services
+moodist
+ntfy
+romm
+vault
+vpn

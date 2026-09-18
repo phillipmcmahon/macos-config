@@ -468,6 +468,7 @@ MANAGED_DIRECTORIES=(
 
 MANAGED_FILES=(
     ".config/.zsh_functions"
+    ".config/cloudns/hosts.txt"
     ".config/topgrade.toml"
     ".gitconfig"
     ".gnupg/gpg-agent.conf"
