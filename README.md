@@ -22,6 +22,7 @@ Stored beneath the repository's `home` directory and restored on every machine.
 ## Shared managed paths
 
 - `~/.config/git/`
+- `~/docs/`
 - `~/scripts/`
 
 ## Machine-specific files and paths

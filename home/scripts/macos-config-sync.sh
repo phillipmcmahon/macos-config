@@ -524,6 +524,7 @@ SCAN_TEMP_DIR=""
 # machine-specific arrays below.
 MANAGED_DIRECTORIES=(
     ".config/git"
+    "docs"
     "scripts"
 )
 
