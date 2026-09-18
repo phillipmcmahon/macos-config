@@ -34,18 +34,24 @@ Stored beneath `machines/<machine-name>/home` and restored only on the machine w
 - `~/Moom.plist`
 
 Caches, logs and known credential files are excluded via `EXCLUDE_PATTERNS`.
-New files inside managed directories are local-only by default. Enrol one with
+Configure scopes in `~/.config/macos-config-sync/config` using literal arrays.
+Omitted arrays retain built-in defaults. Shared defaults include `.config/git`,
+`docs` and `scripts`. Directories recursively include new eligible files on sync.
+Use `EXPLICIT_DIRECTORIES=("scripts")` for manual enrolment in selected scopes,
+or `AUTO_ADD=0` for manual enrolment everywhere. In those scopes enrol with
 `macos-config-sync.sh add scripts/example.sh`, then run `sync`.
 `forget scripts/example.sh` keeps this Mac's local file and proposes deleting
-the repository copy. Other Macs will see that deletion. `AUTO_ADD=1` explicitly
-enables the older automatic-enrolment behaviour. Individual configured files
+the repository copy. Other Macs will see that deletion. Forgotten files remain
+excluded even in automatic mode until added again. Individual configured files
 are always managed unless forgotten or excluded.
 
 ## Baseline and recovery
 
-After upgrading an already-synchronised Mac, inspect the checkout and run
+After upgrading from v3.0 on an already-synchronised Mac, inspect the checkout and run
 `macos-config-sync.sh adopt` once. This explicitly trusts it as the last deployed
-state. Fresh Macs should use deliberate `pull` or `restore` instead.
+state. v3.1 baselines are retained without another adopt. Finish or cancel any
+pending work before changing configuration. Fresh Macs should use deliberate
+`pull` or `restore` instead.
 Python 3 is required. Pending transactions check SHA-256 HOME snapshots before
 deploying and stop if newer local edits exist. Resolve rebase conflicts inside
 the repository and run `git rebase --continue`, then `sync`.

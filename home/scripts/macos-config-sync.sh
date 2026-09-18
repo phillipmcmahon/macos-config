@@ -2,7 +2,17 @@
 #
 # macos-config-sync.sh
 #
-# Version: 3.1.0
+# Version: 3.2.0
+#
+# v3.2.0:
+#   - Configured directories recursively enrol eligible files by default.
+#   - Managed scopes live in ~/.config/macos-config-sync/config when present.
+#     The restricted array format is parsed as data, never sourced as code.
+#   - EXPLICIT_DIRECTORIES opts selected directories into manual enrolment.
+#     AUTO_ADD=0 retains manual enrolment globally. Exclusions still apply.
+#   - docs is included in the default shared directories. Forget remains sticky.
+#   - Existing v3.1 baseline/state is retained. Finish or cancel pending work
+#     with the old configuration before changing enrolment settings.
 #
 # v3.1.0 (review remediation):
 #   F1 DONE: Resume is invoked outside conditional function contexts. Critical
@@ -421,8 +431,8 @@
 #   3. A private GitHub repository
 #   4. A repository mirror on a mounted NAS
 #
-# Add or remove managed files and directories only in the MANAGED_FILES and
-# MANAGED_DIRECTORIES arrays below. Exclusion patterns are maintained once in
+# Override managed paths in ~/.config/macos-config-sync/config, not this script.
+# The arrays below provide defaults. Exclusion patterns are maintained once in
 # EXCLUDE_PATTERNS and used for both rsync filtering and .gitignore generation.
 #
 # Commands:
@@ -448,7 +458,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.2.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -494,7 +504,11 @@ DRY_RUN="${DRY_RUN:-0}"
 # Deletions are never propagated silently by sync. Interactive runs prompt;
 # unattended runs must opt in explicitly with ACCEPT_DELETIONS=1.
 ACCEPT_DELETIONS="${ACCEPT_DELETIONS:-0}"
-AUTO_ADD="${AUTO_ADD:-0}"
+AUTO_ADD_ENV_SET="${AUTO_ADD+x}"
+AUTO_ADD="${AUTO_ADD:-1}"
+CONFIG_FILE="${CONFIG_FILE:-$HOME/.config/macos-config-sync/config}"
+EXPLICIT_DIRECTORIES=()
+EXTRA_EXCLUDE_PATTERNS=()
 GENERATED_ROOT=""
 SYNC_STATE=""
 SCAN_TEMP_DIR=""
@@ -505,15 +519,16 @@ SCAN_TEMP_DIR=""
 # Managed paths
 # ----
 #
-# Add or remove entries only in these four arrays.
+# Override these arrays in CONFIG_FILE. Omitted arrays retain these defaults.
+# Directories include future eligible files recursively, without 'add'.
 #
 # Paths are relative to $HOME.
 # Do not use a leading or trailing slash.
 #
 # Examples:
-#   MANAGED_DIRECTORIES+=(".ssh/config.d")
-#   MANAGED_FILES+=(".vimrc")
-#   MACHINE_FILES+=(".config/some-tool/machine-local.toml")
+#   MANAGED_DIRECTORIES=(".config/git" "docs" "scripts" ".ssh/config.d")
+#   MACHINE_DIRECTORIES=(".config/some-tool")
+# Use complete replacement arrays, not +=. Omitted arrays retain defaults.
 #
 
 # Shared paths — identical on every machine. Stored under home/ in the
@@ -600,7 +615,75 @@ EXCLUDE_PATTERNS=(
     '*.pfx'
 )
 
-# Build rsync --exclude flags from the single source of truth above.
+# Read a deliberately restricted Bash-style array format as data, not code.
+# Only literal values, comments, array assignment and AUTO_ADD=0/1 are allowed.
+# Reject symlinks and group/world-writable configuration. Built-in exclusions
+# cannot be removed by configuration, only extended with EXTRA_EXCLUDE_PATTERNS.
+if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+    _config_values="$(python3 - "$CONFIG_FILE" "$AUTO_ADD_ENV_SET" <<'PYCONFIG'
+import os, pathlib, re, shlex, stat, sys
+try:
+    path = pathlib.Path(sys.argv[1])
+    if not path.is_absolute(): raise ValueError('CONFIG_FILE must be absolute')
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError('Configuration path must not contain symlinks')
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError('Configuration must be a regular file owned by you, not writable by group/others')
+    allowed = {'MANAGED_DIRECTORIES', 'MANAGED_FILES', 'MACHINE_DIRECTORIES',
+               'MACHINE_FILES', 'EXPLICIT_DIRECTORIES', 'EXTRA_EXCLUDE_PATTERNS'}
+    lexer = shlex.shlex(path.read_text(), posix=True, punctuation_chars='=()')
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    i, seen, output = 0, set(), []
+    while i < len(tokens):
+        key = tokens[i]
+        i += 1
+        if key in seen or key not in allowed | {'AUTO_ADD'}:
+            raise ValueError('Unknown or repeated setting: ' + key)
+        seen.add(key)
+        if i >= len(tokens): raise ValueError('Missing assignment: ' + key)
+        # shlex groups adjacent punctuation, so normalise =( and =().
+        if tokens[i] in ('=(', '=()'):
+            tokens[i:i+1] = list(tokens[i])
+        if tokens[i] != '=': raise ValueError('Expected = after ' + key)
+        i += 1
+        if key == 'AUTO_ADD':
+            if i >= len(tokens) or tokens[i] not in ('0', '1'):
+                raise ValueError('AUTO_ADD must be 0 or 1')
+            if not sys.argv[2]: output.append('AUTO_ADD=' + tokens[i])
+            i += 1
+            continue
+        if i < len(tokens) and tokens[i] == '()': tokens[i:i+1] = ['(', ')']
+        if i >= len(tokens) or tokens[i] != '(':
+            raise ValueError('Expected array for ' + key)
+        i += 1
+        values = []
+        while i < len(tokens) and tokens[i] != ')':
+            value = tokens[i]
+            if not value or any(c in value for c in '$`\n\r') or value in ('(', '=', '()'):
+                raise ValueError('Only non-empty literal array values are supported')
+            values.append(value)
+            i += 1
+        if i >= len(tokens): raise ValueError('Unclosed array: ' + key)
+        i += 1
+        output.append(key + '=(' + ' '.join(shlex.quote(v) for v in values) + ')')
+    print('\n'.join(output))
+except Exception as exc:
+    print('Invalid configuration: ' + str(exc), file=sys.stderr)
+    sys.exit(1)
+PYCONFIG
+)" || exit 1
+    # Only parser-produced, shell-quoted assignments reach eval.
+    eval "$_config_values"
+    unset _config_values
+elif [[ "$CONFIG_FILE" != "$HOME/.config/macos-config-sync/config" ]]; then
+    printf 'Configuration file not found: %s\n' "$CONFIG_FILE" >&2
+    exit 1
+fi
+EXCLUDE_PATTERNS+=("${EXTRA_EXCLUDE_PATTERNS[@]+"${EXTRA_EXCLUDE_PATTERNS[@]}"}")
+
+# Build rsync --exclude flags from the effective exclusion list.
 DIRECTORY_EXCLUDES=()
 for _pat in "${EXCLUDE_PATTERNS[@]}"; do
     DIRECTORY_EXCLUDES+=(--exclude="$_pat")
@@ -863,7 +946,9 @@ Environment overrides:
   MACHINE_NAME      Override the auto-detected machine name (default:
                     scutil --get LocalHostName, fallback: hostname -s)
   DRY_RUN=1         Read-only operation explanation, not a computed remote diff
-  AUTO_ADD=1        Opt in to automatic enrolment of new directory files
+  CONFIG_FILE      Managed-path settings (default: ~/.config/macos-config-sync/config)
+  AUTO_ADD=0        Require explicit enrolment globally (default: 1, recursive)
+                    EXPLICIT_DIRECTORIES in config selects manual-only directories
   ACCEPT_DELETIONS=1
                     Allow sync to propagate displayed deletions without an
                     interactive confirmation (required for unattended runs)
@@ -879,7 +964,9 @@ Upgrade from v3.0 on an already-synchronised Mac:
 
 Only adopt if the checkout represents the last state applied to this Mac.
 New Macs should explicitly pull/restore, which records a deployed baseline.
-Python 3 is required. New directory files stay local until 'add scripts/foo.sh'.
+Python 3 is required. Eligible directory files are enrolled recursively by default.
+Use EXPLICIT_DIRECTORIES in CONFIG_FILE for manual-only scopes, then 'add PATH'.
+Upgrades from v3.1 retain the baseline: no new adopt. Finish pending work first.
 'forget' preserves this Mac's local file but proposes a repository deletion,
 which other Macs will see on their next sync. Excluded credentials cannot be added.
 Pending transactions refuse changed HOME files or changed ownership settings.
@@ -993,6 +1080,15 @@ validate_configuration() {
 
     for path in "${MACHINE_FILES[@]}"; do
         validate_managed_path "$path"
+    done
+
+    for path in "${EXPLICIT_DIRECTORIES[@]+"${EXPLICIT_DIRECTORIES[@]}"}"; do
+        validate_managed_path "$path"
+        local found=0 directory
+        for directory in "${MANAGED_DIRECTORIES[@]}" "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}"; do
+            [[ "$directory" != "$path" ]] || found=1
+        done
+        [[ "$found" == 1 ]] || die "EXPLICIT_DIRECTORIES must name configured managed directories: $path"
     done
 
     ensure_machine_name
@@ -1364,18 +1460,24 @@ EOF
         cat <<'EOF'
 
 Caches, logs and known credential files are excluded via `EXCLUDE_PATTERNS`.
-New files inside managed directories are local-only by default. Enrol one with
+Configure scopes in `~/.config/macos-config-sync/config` using literal arrays.
+Omitted arrays retain built-in defaults. Shared defaults include `.config/git`,
+`docs` and `scripts`. Directories recursively include new eligible files on sync.
+Use `EXPLICIT_DIRECTORIES=("scripts")` for manual enrolment in selected scopes,
+or `AUTO_ADD=0` for manual enrolment everywhere. In those scopes enrol with
 `macos-config-sync.sh add scripts/example.sh`, then run `sync`.
 `forget scripts/example.sh` keeps this Mac's local file and proposes deleting
-the repository copy. Other Macs will see that deletion. `AUTO_ADD=1` explicitly
-enables the older automatic-enrolment behaviour. Individual configured files
+the repository copy. Other Macs will see that deletion. Forgotten files remain
+excluded even in automatic mode until added again. Individual configured files
 are always managed unless forgotten or excluded.
 
 ## Baseline and recovery
 
-After upgrading an already-synchronised Mac, inspect the checkout and run
+After upgrading from v3.0 on an already-synchronised Mac, inspect the checkout and run
 `macos-config-sync.sh adopt` once. This explicitly trusts it as the last deployed
-state. Fresh Macs should use deliberate `pull` or `restore` instead.
+state. v3.1 baselines are retained without another adopt. Finish or cancel any
+pending work before changing configuration. Fresh Macs should use deliberate
+`pull` or `restore` instead.
 Python 3 is required. Pending transactions check SHA-256 HOME snapshots before
 deploying and stop if newer local edits exist. Resolve rebase conflicts inside
 the repository and run `git rebase --continue`, then `sync`.
@@ -1758,13 +1860,14 @@ sync_files() {
         --shared-dirs "${MANAGED_DIRECTORIES[@]}" \
         --machine-files "${MACHINE_FILES[@]}" \
         --machine-dirs "${MACHINE_DIRECTORIES[@]+"${MACHINE_DIRECTORIES[@]}"}" \
+        --explicit-dirs "${EXPLICIT_DIRECTORIES[@]+"${EXPLICIT_DIRECTORIES[@]}"}" \
         --excludes "${EXCLUDE_PATTERNS[@]}" <<'PY'
 import argparse, fnmatch, hashlib, json, os, pathlib, shutil, stat, subprocess, sys, tempfile
 
 p = argparse.ArgumentParser()
 for name in ('action', 'home', 'repo', 'machine', 'auto', 'value'):
     p.add_argument(name)
-for name in ('shared-files', 'shared-dirs', 'machine-files', 'machine-dirs', 'excludes'):
+for name in ('shared-files', 'shared-dirs', 'machine-files', 'machine-dirs', 'explicit-dirs', 'excludes'):
     p.add_argument('--' + name, nargs='*', default=[])
 a = p.parse_args()
 home, repo = pathlib.Path(a.home), pathlib.Path(a.repo)
@@ -1843,6 +1946,7 @@ def excluded(s):
 
 config = [a.shared_files, a.shared_dirs, a.machine_files, a.machine_dirs,
           a.excludes, ownership, a.auto, str(home), str(repo), a.machine]
+if a.explicit_dirs: config.append(a.explicit_dirs)
 
 def inventory():
     result = {}
@@ -1926,8 +2030,10 @@ try:
         m = load_manifest()
         check(m)
         known = tracked(m['base'])
-        selected = set(known) | set(a.shared_files + a.machine_files) | set(ownership['add'])
-        if a.auto == '1': selected |= set(m['home'])
+        selected = set(known) | set(a.shared_files + a.machine_files) | {s for s in ownership['add'] if mapping(s)}
+        if a.auto == '1':
+            selected |= {s for s in m['home']
+                         if not any(s.startswith(d + '/') for d in a.explicit_dirs)}
         for s in sorted(selected):
             if excluded(s): continue
             dest = safe(repo, mapping(s))
@@ -1943,6 +2049,7 @@ try:
                 dest.unlink()
         # Forget removes the repository copy only. The HOME file is local-only.
         for s in ownership['forget']:
+            if not mapping(s): continue  # Scope removed, leave repository history alone.
             dest = safe(repo, mapping(s))
             if dest.exists():
                 if not dest.is_file(): raise RuntimeError('Forget requires a file: ' + s)
@@ -2872,6 +2979,11 @@ printf '%sNAS SMB repository:%s %s\n' "$C_BLUE" "$C_RESET" "$NAS_REPO_DIR"
 printf '%sBackup directory:%s  %s\n' "$C_BLUE" "$C_RESET" "$BACKUP_ROOT"
 printf '%sBackup retention:%s  %s\n' "$C_BLUE" "$C_RESET" "$BACKUP_RETENTION"
 printf '%sMachine name:%s      %s\n' "$C_BLUE" "$C_RESET" "$MACHINE"
+printf '%sConfiguration:%s     %s\n' "$C_BLUE" "$C_RESET" "$CONFIG_FILE"
+printf '%sAutomatic enrolment:%s %s (0=manual, 1=recursive)\n' "$C_BLUE" "$C_RESET" "$AUTO_ADD"
+if (( ${#EXPLICIT_DIRECTORIES[@]} > 0 )); then
+    printf 'Manual-only directory: %s\n' "${EXPLICIT_DIRECTORIES[@]}"
+fi
 printf '\n%sShared managed paths:%s\n' "$C_BOLD" "$C_RESET"
 print_managed_paths
 printf '\n%sMachine-specific paths (machines/%s/home):%s\n' "$C_BOLD" "$MACHINE" "$C_RESET"
