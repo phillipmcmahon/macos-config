@@ -2,7 +2,15 @@
 #
 # macos-config-sync.sh
 #
-# Version: 3.0.0
+# Version: 3.0.1
+#
+# v3.0.1:
+#   - Improved: sync now stops after reconciliation when the final Git commit
+#     is identical to the starting commit and nothing remains to push. This
+#     skips the local backup, repository-to-HOME deployment, Moom import and
+#     NAS mirror on a genuine no-change run.
+#   - Pending sync marker files are removed before the no-change return so an
+#     interrupted or resumed no-op cannot leave a false pending state.
 #
 # v3.0.0:
 #   - New: 'sync' is the normal multi-machine workflow. It snapshots HOME
@@ -414,7 +422,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.0.1"
 readonly SCRIPT_NAME="${0##*/}"
 
 # Prefer Homebrew binaries over the older macOS-supplied tools.
@@ -2407,6 +2415,19 @@ finish_reconciled_sync() {
     local final_deletions="$temp_dir/final-deletions"
     local pending_deletions="$temp_dir/pending-deletions"
     local accepted_deletions="$REPO_DIR/.git/macos-config-sync-accepted-local-deletions"
+    local final_commit=""
+
+    if [[ "$DRY_RUN" != "1" && -n "$base_commit" ]]; then
+        final_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
+
+        if [[ "$final_commit" == "$base_commit" ]] && ! has_unpushed_commits; then
+            rm -f "$REPO_DIR/.git/macos-config-sync-pending-base"
+            rm -f "$accepted_deletions"
+            ok "No configuration changes detected"
+            log "Skipping local backup, deployment, Moom import and NAS mirror"
+            return 0
+        fi
+    fi
 
     : >"$final_deletions"
     [[ -n "$base_commit" ]] &&
