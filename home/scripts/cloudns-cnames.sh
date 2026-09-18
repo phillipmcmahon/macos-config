@@ -2,7 +2,19 @@
 #
 # cloudns-cnames.sh
 #
-# Version: 1.3.0
+# Version: 1.4.0
+#
+# v1.4.0:
+#   - Added colourised terminal output matching the style used by the existing
+#     macOS management scripts.
+#   - Section headings are displayed in blue.
+#   - Successful operations are displayed in green.
+#   - Dry-run operations and informational warnings are displayed in yellow.
+#   - Delete operations and errors are displayed in red.
+#   - Colours are disabled automatically when stdout is not a terminal.
+#   - Added timestamped logging.
+#   - Improved help layout for easier scanning.
+#   - No DNS reconciliation or deletion behaviour was changed.
 #
 # v1.3.0:
 #   - Added --delete mode.
@@ -39,96 +51,15 @@
 #   - Blank lines and lines beginning with # are ignored in the hosts file.
 #   - Refuses to modify a hostname if multiple CNAME records are returned.
 #
-# Usage:
-#   cloudns-cnames.sh [--hosts-file FILE] [--dry-run] [--delete]
-#
-# Examples:
-#
-#   Preview normal reconciliation:
-#
-#       cloudns-cnames.sh --dry-run
-#
-#   Apply normal reconciliation:
-#
-#       cloudns-cnames.sh
-#
-#   Preview deletion of records in the default hosts file:
-#
-#       cloudns-cnames.sh --delete --dry-run
-#
-#   Delete records in the default hosts file:
-#
-#       cloudns-cnames.sh --delete
-#
-#   Preview deletion using an alternative hosts file:
-#
-#       cloudns-cnames.sh \
-#           --hosts-file /path/to/alternate-hosts.txt \
-#           --delete \
-#           --dry-run
-#
-# Authentication:
-#   Credentials are loaded automatically from:
-#
-#       ~/.config/cloudns/credentials
-#
-#   The file may define:
-#
-#       CLOUDNS_AUTH_ID='YOUR_AUTH_ID'
-#       CLOUDNS_AUTH_PASSWORD='YOUR_API_PASSWORD'
-#
-#   Existing environment variables take precedence over values in the file.
-#   If the credentials file does not exist, the script falls back to the
-#   environment.
-#
-#   At least CLOUDNS_AUTH_ID and CLOUDNS_AUTH_PASSWORD must be available from
-#   one of these sources.
-#
-# Hosts file:
-#   The default hosts file is:
-#
-#       ~/.config/cloudns/hosts.txt
-#
-#   Use --hosts-file FILE to override the default location.
-#
-# Hosts file format:
-#   One relative DNS hostname per line.
-#
-#   Blank lines and lines beginning with # are ignored.
-#
-#   Example:
-#
-#       # S3
-#       *.s3
-#       s3
-#
-#       # Media
-#       emby
-#       jellyfin
-#       music
-#
-#       # Services
-#       moodist
-#       ntfy
-#       romm
-#       vault
-#       vpn
-#
-# Normal mode:
-#   Ensures each listed hostname has a CNAME pointing to TARGET with the
-#   configured TTL.
-#
-# Delete mode:
-#   Removes CNAME records for each hostname listed in the hosts file.
-#   Other DNS record types are not removed.
-#
-# The configured TARGET is the zone apex expressed as its fully qualified
-# hostname. For example, TARGET="phillipmcmahon.com" is equivalent to using
-# @ as the target in the ClouDNS web interface.
-#
 
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
+
+# Prefer Homebrew binaries over older macOS-supplied tools.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_NAME="${0##*/}"
 
 # ----
 # Configuration
@@ -147,55 +78,350 @@ DELETE_MODE=false
 HOSTS_FILE="$DEFAULT_HOSTS_FILE"
 
 # ----
-# Helpers
+# Colours
+# ----
+
+if [[ -t 1 ]]; then
+    C_GREEN=$'\033[0;32m'
+    C_RED=$'\033[0;31m'
+    C_YELLOW=$'\033[0;33m'
+    C_BLUE=$'\033[0;34m'
+    C_BOLD=$'\033[1m'
+    C_RESET=$'\033[0m'
+else
+    C_GREEN=""
+    C_RED=""
+    C_YELLOW=""
+    C_BLUE=""
+    C_BOLD=""
+    C_RESET=""
+fi
+
+# ----
+# Logging
 # ----
 
 log() {
-    printf '[cloudns-cnames] %s\n' "$*"
+    printf '%s[%s]%s %s\n' \
+        "$C_GREEN" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$C_RESET" \
+        "$*"
+}
+
+ok() {
+    printf '%s[%s] ✔ %s%s\n' \
+        "$C_GREEN" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$*" \
+        "$C_RESET"
+}
+
+step() {
+    printf '%s[%s] ▸ %s%s\n' \
+        "$C_BLUE" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$*" \
+        "$C_RESET"
+}
+
+warn() {
+    printf '%s[%s] WARNING: %s%s\n' \
+        "$C_YELLOW" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$*" \
+        "$C_RESET" >&2
 }
 
 die() {
-    printf '[cloudns-cnames] ERROR: %s\n' "$*" >&2
+    printf '%s[%s] ERROR: %s%s\n' \
+        "$C_RED" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$*" \
+        "$C_RESET" >&2
+
     exit 1
 }
 
+# ----
+# Record output
+# ----
+
+print_ok_record() {
+    local host="$1"
+    local target="$2"
+    local ttl="$3"
+
+    printf '%sOK      %-16s -> %s  TTL=%s%s\n' \
+        "$C_GREEN" \
+        "$host" \
+        "$target" \
+        "$ttl" \
+        "$C_RESET"
+}
+
+print_create_record() {
+    local host="$1"
+    local target="$2"
+    local ttl="$3"
+
+    if "$DRY_RUN"; then
+        printf '%sCREATE  %-16s -> %s  TTL=%s  [DRY RUN]%s\n' \
+            "$C_YELLOW" \
+            "$host" \
+            "$target" \
+            "$ttl" \
+            "$C_RESET"
+    else
+        printf '%sCREATE  %-16s -> %s  TTL=%s%s\n' \
+            "$C_GREEN" \
+            "$host" \
+            "$target" \
+            "$ttl" \
+            "$C_RESET"
+    fi
+}
+
+print_update_record() {
+    local host="$1"
+    local old_target="$2"
+    local old_ttl="$3"
+    local new_target="$4"
+    local new_ttl="$5"
+
+    if "$DRY_RUN"; then
+        printf '%sUPDATE  %-16s %s TTL=%s -> %s TTL=%s  [DRY RUN]%s\n' \
+            "$C_YELLOW" \
+            "$host" \
+            "$old_target" \
+            "$old_ttl" \
+            "$new_target" \
+            "$new_ttl" \
+            "$C_RESET"
+    else
+        printf '%sUPDATE  %-16s %s TTL=%s -> %s TTL=%s%s\n' \
+            "$C_GREEN" \
+            "$host" \
+            "$old_target" \
+            "$old_ttl" \
+            "$new_target" \
+            "$new_ttl" \
+            "$C_RESET"
+    fi
+}
+
+print_delete_record() {
+    local host="$1"
+    local target="$2"
+    local ttl="$3"
+    local record_id="$4"
+
+    if "$DRY_RUN"; then
+        printf '%sDELETE  %-16s -> %s  TTL=%s  ID=%s  [DRY RUN]%s\n' \
+            "$C_YELLOW" \
+            "$host" \
+            "$target" \
+            "$ttl" \
+            "$record_id" \
+            "$C_RESET"
+    else
+        printf '%sDELETE  %-16s -> %s  TTL=%s  ID=%s%s\n' \
+            "$C_RED" \
+            "$host" \
+            "$target" \
+            "$ttl" \
+            "$record_id" \
+            "$C_RESET"
+    fi
+}
+
+print_absent_record() {
+    local host="$1"
+
+    printf '%sABSENT  %-16s no CNAME record found%s\n' \
+        "$C_YELLOW" \
+        "$host" \
+        "$C_RESET"
+}
+
+print_record_error() {
+    local host="$1"
+
+    printf '%sERROR   %s.%s%s\n' \
+        "$C_RED" \
+        "$host" \
+        "$DOMAIN" \
+        "$C_RESET"
+}
+
+# ----
+# Error handling
+# ----
+
+on_error() {
+    local exit_code=$?
+    local line_number="${1:-unknown}"
+
+    printf '%s[%s] ERROR: Command failed at line %s with exit code %s%s\n' \
+        "$C_RED" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$line_number" \
+        "$exit_code" \
+        "$C_RESET" >&2
+
+    exit "$exit_code"
+}
+
+trap 'on_error "$LINENO"' ERR
+
+# ----
+# Usage
+# ----
+
 usage() {
     cat <<EOF
-Usage:
-    $(basename "$0") [--hosts-file FILE] [--dry-run] [--delete]
+${C_BOLD}${SCRIPT_NAME}${C_RESET} version ${SCRIPT_VERSION}
 
-Options:
-    --hosts-file FILE   Override the default hosts file
-                        Default: $DEFAULT_HOSTS_FILE
+Manage the defined CNAME records for:
 
-    --dry-run           Show changes without applying them
+    ${C_BOLD}${DOMAIN}${C_RESET}
 
-    --delete            Delete CNAME records listed in the hosts file
-                        instead of reconciling them
 
-    -h, --help          Show this help
+${C_BLUE}${C_BOLD}USAGE${C_RESET}
 
-Authentication:
-    Credentials are loaded automatically from:
+    ${SCRIPT_NAME} [OPTIONS]
 
-        $CREDENTIALS_FILE
+
+${C_BLUE}${C_BOLD}MODES${C_RESET}
+
+    Default
+        Reconcile the configured CNAME records.
+
+        Missing records are created.
+        Incorrect targets or TTL values are updated.
+        Correct records are left unchanged.
+
+    --delete
+        Delete the configured CNAME records instead of reconciling them.
+
+        Other DNS record types at the same hostname are not affected.
+
+
+${C_BLUE}${C_BOLD}OPTIONS${C_RESET}
+
+    --hosts-file FILE
+        Read hostnames from FILE instead of the default hosts file.
+
+        Default:
+            ${DEFAULT_HOSTS_FILE}
+
+    --dry-run
+        Show the changes that would be made without modifying DNS.
+
+        May be used with either reconciliation or --delete mode.
+
+    --delete
+        Delete the CNAME records listed in the hosts file.
+
+    --version
+        Display the script version.
+
+    -h, --help
+        Display this help.
+
+
+${C_BLUE}${C_BOLD}DNS CONFIGURATION${C_RESET}
+
+    Zone:
+        ${DOMAIN}
+
+    CNAME target:
+        ${TARGET}
+
+    TTL:
+        ${TTL} seconds
+
+
+${C_BLUE}${C_BOLD}HOSTS FILE${C_RESET}
+
+    Default:
+        ${DEFAULT_HOSTS_FILE}
+
+    Format:
+        One relative DNS hostname per line.
+
+    Blank lines and lines beginning with # are ignored.
+
+    Example:
+
+        # S3
+        *.s3
+        s3
+
+        # Media
+        emby
+        jellyfin
+        music
+
+        # Services
+        moodist
+        ntfy
+        romm
+        vault
+        vpn
+
+
+${C_BLUE}${C_BOLD}AUTHENTICATION${C_RESET}
+
+    ClouDNS credentials are loaded automatically from:
+
+        ${CREDENTIALS_FILE}
+
+    The file may contain:
+
+        CLOUDNS_AUTH_ID='YOUR_AUTH_ID'
+        CLOUDNS_AUTH_PASSWORD='YOUR_API_PASSWORD'
 
     Existing CLOUDNS_AUTH_ID and CLOUDNS_AUTH_PASSWORD environment
-    variables take precedence over values in the credentials file.
+    variables take precedence over values loaded from the credentials file.
 
-Examples:
-    $(basename "$0") --dry-run
-    $(basename "$0")
 
-    $(basename "$0") --delete --dry-run
-    $(basename "$0") --delete
+${C_BLUE}${C_BOLD}EXAMPLES${C_RESET}
 
-    $(basename "$0") \
-        --hosts-file /path/to/alternate-hosts.txt \
-        --delete \
-        --dry-run
+    Preview CNAME reconciliation:
+
+        ${SCRIPT_NAME} --dry-run
+
+    Apply CNAME reconciliation:
+
+        ${SCRIPT_NAME}
+
+    Preview deletion:
+
+        ${SCRIPT_NAME} --delete --dry-run
+
+    Delete the configured CNAME records:
+
+        ${SCRIPT_NAME} --delete
+
+    Use an alternative hosts file:
+
+        ${SCRIPT_NAME} \\
+            --hosts-file /path/to/alternate-hosts.txt \\
+            --dry-run
+
+    Preview deletion using an alternative hosts file:
+
+        ${SCRIPT_NAME} \\
+            --hosts-file /path/to/alternate-hosts.txt \\
+            --delete \\
+            --dry-run
 EOF
 }
+
+# ----
+# Credentials
+# ----
 
 load_credentials() {
     local existing_auth_id="${CLOUDNS_AUTH_ID:-}"
@@ -209,6 +435,7 @@ load_credentials() {
 
         # Explicit environment variables supplied by the caller take
         # precedence over values loaded from the credentials file.
+
         if [[ -n "$existing_auth_id" ]]; then
             CLOUDNS_AUTH_ID="$existing_auth_id"
         fi
@@ -217,7 +444,7 @@ load_credentials() {
             CLOUDNS_AUTH_PASSWORD="$existing_auth_password"
         fi
     else
-        log "Credentials file not found. Using environment variables."
+        warn "Credentials file not found. Using environment variables."
     fi
 
     [[ -n "${CLOUDNS_AUTH_ID:-}" ]] ||
@@ -229,6 +456,10 @@ load_credentials() {
     export CLOUDNS_AUTH_ID
     export CLOUDNS_AUTH_PASSWORD
 }
+
+# ----
+# ClouDNS API
+# ----
 
 api_request() {
     local endpoint="$1"
@@ -252,11 +483,20 @@ check_api_response() {
         type == "object"
         and .status? == "Failed"
     ' <<<"$response" >/dev/null 2>&1; then
-        printf '[cloudns-cnames] ERROR: ClouDNS API request failed:\n' >&2
+
+        printf '%s[%s] ERROR: ClouDNS API request failed:%s\n' \
+            "$C_RED" \
+            "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "$C_RESET" >&2
+
         jq . <<<"$response" >&2
         exit 1
     fi
 }
+
+# ----
+# Record retrieval
+# ----
 
 get_record() {
     local host="$1"
@@ -277,13 +517,20 @@ get_record() {
     printf '%s\n' "$response"
 }
 
+# ----
+# Create
+# ----
+
 create_record() {
     local host="$1"
     local response
 
     if "$DRY_RUN"; then
-        printf 'CREATE  %-16s -> %s  TTL=%s\n' \
-            "$host" "$TARGET" "$TTL"
+        print_create_record \
+            "$host" \
+            "$TARGET" \
+            "$TTL"
+
         return
     fi
 
@@ -299,9 +546,15 @@ create_record() {
 
     check_api_response "$response"
 
-    printf 'CREATE  %-16s -> %s  TTL=%s\n' \
-        "$host" "$TARGET" "$TTL"
+    print_create_record \
+        "$host" \
+        "$TARGET" \
+        "$TTL"
 }
+
+# ----
+# Update
+# ----
 
 update_record() {
     local record_id="$1"
@@ -311,8 +564,13 @@ update_record() {
     local response
 
     if "$DRY_RUN"; then
-        printf 'UPDATE  %-16s %s TTL=%s -> %s TTL=%s\n' \
-            "$host" "$old_target" "$old_ttl" "$TARGET" "$TTL"
+        print_update_record \
+            "$host" \
+            "$old_target" \
+            "$old_ttl" \
+            "$TARGET" \
+            "$TTL"
+
         return
     fi
 
@@ -328,9 +586,17 @@ update_record() {
 
     check_api_response "$response"
 
-    printf 'UPDATE  %-16s %s TTL=%s -> %s TTL=%s\n' \
-        "$host" "$old_target" "$old_ttl" "$TARGET" "$TTL"
+    print_update_record \
+        "$host" \
+        "$old_target" \
+        "$old_ttl" \
+        "$TARGET" \
+        "$TTL"
 }
+
+# ----
+# Delete
+# ----
 
 delete_record() {
     local record_id="$1"
@@ -340,8 +606,12 @@ delete_record() {
     local response
 
     if "$DRY_RUN"; then
-        printf 'DELETE  %-16s -> %s  TTL=%s  ID=%s\n' \
-            "$host" "$current_target" "$current_ttl" "$record_id"
+        print_delete_record \
+            "$host" \
+            "$current_target" \
+            "$current_ttl" \
+            "$record_id"
+
         return
     fi
 
@@ -354,8 +624,11 @@ delete_record() {
 
     check_api_response "$response"
 
-    printf 'DELETE  %-16s -> %s  TTL=%s  ID=%s\n' \
-        "$host" "$current_target" "$current_ttl" "$record_id"
+    print_delete_record \
+        "$host" \
+        "$current_target" \
+        "$current_ttl" \
+        "$record_id"
 }
 
 # ----
@@ -382,13 +655,23 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        --version)
+            printf '%s\n' "$SCRIPT_VERSION"
+            exit 0
+            ;;
+
         -h|--help)
             usage
             exit 0
             ;;
 
         *)
-            printf '[cloudns-cnames] ERROR: Unknown argument: %s\n\n' "$1" >&2
+            printf '%s[%s] ERROR: Unknown argument: %s%s\n\n' \
+                "$C_RED" \
+                "$(date '+%Y-%m-%d %H:%M:%S')" \
+                "$1" \
+                "$C_RESET" >&2
+
             usage
             exit 1
             ;;
@@ -423,6 +706,7 @@ load_credentials
 # ----
 #
 # Normalise the input file before loading it:
+#
 #   - remove CR characters from Windows-style line endings
 #   - trim leading and trailing whitespace
 #   - ignore comments
@@ -458,9 +742,9 @@ mapfile -t HOSTS < <(
 # ----
 
 if "$DELETE_MODE"; then
-    log "ClouDNS CNAME deletion"
+    step "ClouDNS CNAME deletion"
 else
-    log "ClouDNS CNAME reconciliation"
+    step "ClouDNS CNAME reconciliation"
 fi
 
 log "Zone:       $DOMAIN"
@@ -472,14 +756,30 @@ fi
 
 log "Hosts file: $HOSTS_FILE"
 log "Hosts:      ${#HOSTS[@]}"
-log "Delete:     $DELETE_MODE"
-log "Dry run:    $DRY_RUN"
+
+if "$DELETE_MODE"; then
+    log "Mode:       delete"
+else
+    log "Mode:       reconcile"
+fi
+
+if "$DRY_RUN"; then
+    warn "Dry run enabled. No DNS changes will be made."
+fi
 
 printf '\n'
 
 # ----
 # Process DNS records
 # ----
+
+if "$DELETE_MODE"; then
+    step "Processing CNAME deletions"
+else
+    step "Processing CNAME records"
+fi
+
+printf '\n'
 
 for host in "${HOSTS[@]}"; do
     records="$(get_record "$host")"
@@ -509,7 +809,7 @@ for host in "${HOSTS[@]}"; do
 
     if "$DELETE_MODE"; then
         if (( ${#matches[@]} == 0 )); then
-            printf 'ABSENT  %-16s no CNAME record found\n' "$host"
+            print_absent_record "$host"
             continue
         fi
 
@@ -555,8 +855,10 @@ for host in "${HOSTS[@]}"; do
             if [[ "$normalised_target" == "$desired_target" &&
                   "$current_ttl" == "$TTL" ]]; then
 
-                printf 'OK      %-16s -> %s  TTL=%s\n' \
-                    "$host" "$current_target" "$current_ttl"
+                print_ok_record \
+                    "$host" \
+                    "$current_target" \
+                    "$current_ttl"
             else
                 update_record \
                     "$record_id" \
@@ -567,12 +869,28 @@ for host in "${HOSTS[@]}"; do
             ;;
 
         *)
-            printf 'ERROR   %s.%s\n' "$host" "$DOMAIN"
-            printf '        Multiple CNAME records found. No change made.\n'
-            printf '        %s\n' "${matches[@]}"
+            print_record_error "$host"
+
+            printf '%s        Multiple CNAME records found. No change made.%s\n' \
+                "$C_RED" \
+                "$C_RESET"
+
+            for match in "${matches[@]}"; do
+                printf '%s        %s%s\n' \
+                    "$C_RED" \
+                    "$match" \
+                    "$C_RESET"
+            done
             ;;
     esac
 done
 
 printf '\n'
-log "Finished."
+
+if "$DRY_RUN"; then
+    ok "Dry run completed."
+elif "$DELETE_MODE"; then
+    ok "CNAME deletion completed."
+else
+    ok "CNAME reconciliation completed."
+fi
