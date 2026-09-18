@@ -8,6 +8,8 @@ brew "bat"
 brew "bitwarden-cli"
 # GNU File, Shell, and Text utilities
 brew "coreutils"
+# Get a file from an HTTP, HTTPS or FTP server
+brew "curl"
 # Identify or delete duplicate files
 brew "fdupes"
 # Play, record, convert, and stream select audio and video codecs
@@ -54,6 +56,8 @@ cask "audio-hijack"
 cask "bitwarden"
 # Managed desktop virtualization solution
 cask "citrix-workspace"
+# Multi-platform client-side cloud file encryption tool
+cask "cryptomator"
 # Server and cloud storage browser
 cask "cyberduck"
 # Emulator to play GameCube and Wii games

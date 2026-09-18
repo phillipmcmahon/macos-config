@@ -3,8 +3,10 @@ AdGuard VPN
 Amphetamine
 Arq
 Audio Hijack
+AWDL Toggle
 Bitwarden
 Citrix Workspace
+Cryptomator
 Cyberduck
 Dolphin
 Emby
