@@ -1,0 +1,3 @@
+# Relative hostnames, one per line. Replace these examples before use.
+www
+files
