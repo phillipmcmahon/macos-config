@@ -64,6 +64,7 @@ SSH Config Editor
 Steam
 Synergy
 Tailscale
+Task Manager TMOG
 TestFlight
 The Unarchiver
 UniFi Endpoint
