@@ -1,4 +1,3 @@
-.Dolphin Updater.2
 Adguard
 AdGuard VPN
 AltTab
@@ -52,7 +51,6 @@ Pacifist
 Passepartout
 Plex
 Pure Paste
-qBittorrent
 RetroArch
 Rocket
 Safari
@@ -63,6 +61,7 @@ SoundSource
 SpotiFLAC-Next
 Spotify
 SSH Config Editor
+Steam
 Synergy
 Tailscale
 TestFlight

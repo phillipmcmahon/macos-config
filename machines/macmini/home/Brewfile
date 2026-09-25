@@ -28,7 +28,7 @@ brew "gnupg"
 # Library access to GnuPG
 brew "gpgme"
 # Agent multiplexer that lives in your terminal
-brew "herdr", restart_service: :changed
+brew "herdr"
 # Lightweight and flexible command-line JSON processor
 brew "jq"
 # OpenBSD freely-licensed SSH connectivity tools
@@ -121,8 +121,6 @@ cask "openlogi"
 cask "pacifist"
 # Home media player
 cask "plex"
-# Peer to peer Bitorrent client
-cask "qbittorrent"
 # Emoji picker optimised for blind people
 cask "rocket"
 # Screenshot measurement and annotation tool
