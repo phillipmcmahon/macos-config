@@ -1216,11 +1216,11 @@ blastem() {
     }
 
     echo "WARNING: this removes zsh history, completion dumps, and all saved zsh sessions."
-    printf "Type 'DELETE ALL ZSH HISTORY' to continue: "
+    printf "Type 'CONFIRM' to continue: "
 
     local answer
     read -r answer
-    [[ "$answer" == "DELETE ALL ZSH HISTORY" ]] || {
+    [[ "$answer" == "CONFIRM" ]] || {
         echo "Aborted."
         return 1
     }
