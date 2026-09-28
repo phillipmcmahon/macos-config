@@ -37,7 +37,9 @@ NaviBeat
 OneDrive
 OpenLogi
 Passepartout
+Petrichor
 Plex
+PPPlayer
 Pure Paste
 Safari
 SMBMounter

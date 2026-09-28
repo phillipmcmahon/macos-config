@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Script: cert-deploy-npm.sh
-# Purpose: Deploy verified RSA 4096 PEM files over SSH and restart rootless Podman NPM.
-# Version: 1.0.0
+# Purpose: Deploy verified RSA 4096 PEM files to DMZ and services NPM over SSH.
+# Version: 1.1.0
 # Requires: Bash 5+, OpenSSL 3+, ssh, scp and adjacent lib/common.sh.
 # Documentation: docs/cert-deploy-npm-user-manual.md or run with --help.
 #
@@ -11,22 +11,26 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-readonly SCRIPT_VERSION='1.0.0'
+readonly SCRIPT_VERSION='1.1.0'
 readonly VERSION="$SCRIPT_VERSION"
 readonly SCRIPT_NAME="${0##*/}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 [[ -r $SCRIPT_DIR/lib/common.sh ]] || { printf 'ERROR Missing lib/common.sh\n' >&2; exit 1; }
 source "$SCRIPT_DIR/lib/common.sh"
-for helper in load_config log ok die require_cmds reject_symlinks lock_acquire lock_release; do
+for helper in load_config log ok warn die require_cmds reject_symlinks lock_acquire lock_release; do
     declare -F "$helper" > /dev/null || { printf 'ERROR Missing helper: %s\n' "$helper" >&2; exit 1; }
 done
 unset helper
-readonly CONFIG_KEYS='DOMAIN SOURCE_DIR NPM_HOST NPM_CONTAINER DEST_DIR SSH_PORT STOP_TIMEOUT'
+readonly CONFIG_KEYS='DOMAIN SOURCE_DIR NPM_HOST NPM_CONTAINER DEST_DIR SERVICES_NPM_HOST SERVICES_NPM_CONTAINER SERVICES_DEST_DIR SSH_PORT STOP_TIMEOUT'
 DOMAIN='phillipmcmahon.com'
 SOURCE_DIR="$HOME/certificates/phillipmcmahon.com/letsencrypt/rsa-4096"
-NPM_HOST='phillipmcmahon@dmz-podman.phillipmcmahon.com'
-NPM_CONTAINER='proxy.phillipmcmahon.com'
+# Existing NPM_* and DEST_DIR config keys continue to configure the DMZ target.
+NPM_HOST='phillipmcmahon@podman.dmz.phillipmcmahon.com'
+NPM_CONTAINER='proxy.dmz.phillipmcmahon.com'
 DEST_DIR='/home/phillipmcmahon/podman/npm/data/custom_ssl/npm-21'
+SERVICES_NPM_HOST='phillipmcmahon@podman.services.phillipmcmahon.com'
+SERVICES_NPM_CONTAINER='proxy.services.phillipmcmahon.com'
+SERVICES_DEST_DIR='/home/phillipmcmahon/podman/npm/data/custom_ssl/npm-1'
 SSH_PORT=22
 STOP_TIMEOUT=60
 CONFIG_FILE="$SCRIPT_DIR/config/cert-deploy-npm.conf"
@@ -35,6 +39,7 @@ DRY_RUN=1
 MODE_OPTION=''
 STAGING=''
 REMOTE_STAGE=''
+REMOTE_STAGE_HOST=''
 SSH_OPTIONS=()
 SCP_OPTIONS=()
 
@@ -45,8 +50,9 @@ $SCRIPT_NAME $SCRIPT_VERSION
 Usage: $SCRIPT_NAME [OPTIONS]
 
 Upload fullchain.pem and private.key, install as fullchain.pem and privkey.pem,
-and restart the configured NPM container. Default mode is dry-run (no SSH).
-Unchanged remote files are left in place and NPM is not restarted.
+and restart each configured NPM container. Default mode is dry-run (no SSH).
+Deploy to DMZ, then services. Each container is restarted only if its files differ.
+Stop on the first error. Previously completed targets remain updated.
 
 Options:
   --config PATH        Literal config (default: config/cert-deploy-npm.conf)
@@ -57,10 +63,18 @@ Options:
   --version            Show version
   -h, --help           Show help
 
-Defaults:
+DMZ defaults (NPM_HOST, NPM_CONTAINER, DEST_DIR):
   Host:      $NPM_HOST
   Container: $NPM_CONTAINER
   Target:    $DEST_DIR
+
+Services defaults (SERVICES_NPM_HOST, SERVICES_NPM_CONTAINER, SERVICES_DEST_DIR):
+  Host:      $SERVICES_NPM_HOST
+  Container: $SERVICES_NPM_CONTAINER
+  Target:    $SERVICES_DEST_DIR
+
+The optional config file overrides these defaults. SSH_PORT and STOP_TIMEOUT
+apply to both targets.
 
 SSH uses existing keys/agent/config, strict host-key checking and batch mode.
 No sudo, certificate issuance, UniFi changes or scheduling is performed.
@@ -79,15 +93,22 @@ absolute_path() {
     printf '%s\n' "$path"
 }
 
+cleanup_remote_stage() {
+    if [[ -n $REMOTE_STAGE ]]; then
+        ssh "${SSH_OPTIONS[@]}" "$REMOTE_STAGE_HOST" "rm -rf -- '$REMOTE_STAGE'" < /dev/null || {
+            warn "Remote staging cleanup failed. Remove after inspection: $REMOTE_STAGE_HOST:$REMOTE_STAGE"
+            return 1
+        }
+        REMOTE_STAGE=''
+        REMOTE_STAGE_HOST=''
+    fi
+    return 0
+}
+
 cleanup() {
     local rc=$?
     trap - EXIT
-    if [[ -n $REMOTE_STAGE ]]; then
-        ssh "${SSH_OPTIONS[@]}" "$NPM_HOST" "rm -rf -- '$REMOTE_STAGE'" < /dev/null || {
-            warn "Remote staging cleanup failed. Remove after inspection: $REMOTE_STAGE"
-            ((rc != 0)) || rc=1
-        }
-    fi
+    cleanup_remote_stage || { ((rc != 0)) || rc=1; }
     if [[ -n $STAGING ]]; then rm -rf -- "$STAGING" || rc=1; fi
     lock_release || rc=1
     exit "$rc"
@@ -133,9 +154,35 @@ validate_pair() {
 
 file_hash() { openssl dgst -sha256 -r "$1" | cut -d ' ' -f 1; }
 
+validate_target() {
+    local label=$1 host=$2 container=$3 destination=$4
+    # Remote command arguments are restricted to literal shell-safe characters.
+    [[ $host =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || die "$label host must be user@hostname."
+    [[ $container =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Invalid $label container name."
+    [[ $destination =~ ^/[a-zA-Z0-9_./-]+$ && $destination != / && $destination != */ && $destination != *'//'* && /$destination/ != */../* && /$destination/ != */./* ]] || die "$label destination must be an absolute path without spaces or dot components."
+}
+
+deploy_target() {
+    local label=$1 host=$2 container=$3 destination=$4
+    local cert_hash=$5 key_hash=$6 helper=$7 remote_stage
+    log "Deploying to $label: $host:$destination (container: $container)"
+    # The prepare helper checks the target path and container before creating staging.
+    # Register the stage for cleanup only after validating the helper's response.
+    remote_stage=$(ssh "${SSH_OPTIONS[@]}" "$host" "bash -s -- prepare '$destination' '$container'" < "$helper")
+    [[ $remote_stage == "$destination/.cert-deploy."* && ${remote_stage##*/} =~ ^\.cert-deploy\.[a-zA-Z0-9]+$ ]] || die "$label: Unexpected remote staging response."
+    REMOTE_STAGE_HOST=$host
+    REMOTE_STAGE=$remote_stage
+    scp -p "${SCP_OPTIONS[@]}" "$STAGING/fullchain.pem" "$host:$REMOTE_STAGE/fullchain.pem"
+    scp -p "${SCP_OPTIONS[@]}" "$STAGING/private.key" "$host:$REMOTE_STAGE/privkey.pem"
+    ssh "${SSH_OPTIONS[@]}" "$host" "bash -s -- deploy '$destination' '$container' '$REMOTE_STAGE' '$STOP_TIMEOUT' '$cert_hash' '$key_hash'" < "$helper"
+    cleanup_remote_stage
+    ok "$label deployment completed. An unchanged pair does not trigger a restart."
+}
+
 # Operations
 main() {
-    local cert_hash key_hash helper="$SCRIPT_DIR/lib/cert-deploy-npm-remote.sh"
+    local cert_hash key_hash target_index helper="$SCRIPT_DIR/lib/cert-deploy-npm-remote.sh"
+    local -a target_labels target_hosts target_containers target_dirs
     read_configuration "$@"
     while (($#)); do
         case $1 in
@@ -151,13 +198,16 @@ main() {
         esac
         shift
     done
-    require_cmds openssl ssh scp mkdir mktemp cp rm cut
+    require_cmds openssl ssh scp mkdir mktemp cp rm cut touch
     [[ $(openssl version) == 'OpenSSL 3.'* ]] || die 'OpenSSL 3.x is required.'
-    # Remote command arguments are restricted to literal shell-safe characters.
-    [[ $NPM_HOST =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || die 'NPM_HOST must be user@hostname.'
-    [[ $NPM_CONTAINER =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die 'Invalid NPM_CONTAINER.'
+    target_labels=('DMZ' 'services')
+    target_hosts=("$NPM_HOST" "$SERVICES_NPM_HOST")
+    target_containers=("$NPM_CONTAINER" "$SERVICES_NPM_CONTAINER")
+    target_dirs=("$DEST_DIR" "$SERVICES_DEST_DIR")
+    for target_index in "${!target_labels[@]}"; do
+        validate_target "${target_labels[target_index]}" "${target_hosts[target_index]}" "${target_containers[target_index]}" "${target_dirs[target_index]}"
+    done
     [[ $DOMAIN =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && $DOMAIN == *.* ]] || die 'Invalid DOMAIN.'
-    [[ $DEST_DIR =~ ^/[a-zA-Z0-9_./-]+$ && $DEST_DIR != / && $DEST_DIR != */ && $DEST_DIR != *'//'* && /$DEST_DIR/ != */../* && /$DEST_DIR/ != */./* ]] || die 'DEST_DIR must be an absolute path without spaces or dot components.'
     [[ $SSH_PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((SSH_PORT <= 65535)) || die 'Invalid SSH_PORT.'
     [[ $STOP_TIMEOUT =~ ^[1-9][0-9]{0,3}$ ]] || die 'Invalid STOP_TIMEOUT.'
     SOURCE_DIR=$(absolute_path "$SOURCE_DIR" "$SCRIPT_DIR")
@@ -170,10 +220,12 @@ main() {
     fi
     validate_pair "$SOURCE_DIR"
     log "Source: $SOURCE_DIR"
-    log "Target: $NPM_HOST:$DEST_DIR"
-    log "Container: $NPM_CONTAINER (shutdown timeout: ${STOP_TIMEOUT}s)"
+    for target_index in "${!target_labels[@]}"; do
+        log "${target_labels[target_index]} target: ${target_hosts[target_index]}:${target_dirs[target_index]}"
+        log "${target_labels[target_index]} container: ${target_containers[target_index]} (shutdown timeout: ${STOP_TIMEOUT}s)"
+    done
     if ((DRY_RUN)); then
-        log 'Would upload, back up and replace changed files, then restart NPM. No SSH connection made.'
+        log 'Would deploy to DMZ, then services: upload, back up and replace changed files, then restart each changed NPM. No SSH connection made.'
         return
     fi
     SSH_OPTIONS=(-p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
@@ -188,17 +240,12 @@ main() {
     validate_pair "$STAGING"
     cert_hash=$(file_hash "$STAGING/fullchain.pem")
     key_hash=$(file_hash "$STAGING/private.key")
-    # The prepare helper checks the target path and container before creating staging.
-    REMOTE_STAGE=$(ssh "${SSH_OPTIONS[@]}" "$NPM_HOST" "bash -s -- prepare '$DEST_DIR' '$NPM_CONTAINER'" < "$helper")
-    [[ $REMOTE_STAGE == "$DEST_DIR/.cert-deploy."* && ${REMOTE_STAGE##*/} =~ ^\.cert-deploy\.[a-zA-Z0-9]+$ ]] || {
-        REMOTE_STAGE=''
-        die 'Unexpected remote staging response.'
-    }
-    scp -p "${SCP_OPTIONS[@]}" "$STAGING/fullchain.pem" "$NPM_HOST:$REMOTE_STAGE/fullchain.pem"
-    scp -p "${SCP_OPTIONS[@]}" "$STAGING/private.key" "$NPM_HOST:$REMOTE_STAGE/privkey.pem"
-    ssh "${SSH_OPTIONS[@]}" "$NPM_HOST" "bash -s -- deploy '$DEST_DIR' '$NPM_CONTAINER' '$REMOTE_STAGE' '$STOP_TIMEOUT' '$cert_hash' '$key_hash'" < "$helper"
-    ok 'Remote deployment completed. An unchanged pair does not trigger a restart.'
+    for target_index in "${!target_labels[@]}"; do
+        deploy_target "${target_labels[target_index]}" "${target_hosts[target_index]}" "${target_containers[target_index]}" "${target_dirs[target_index]}" "$cert_hash" "$key_hash" "$helper"
+    done
+    ok 'Certificate deployment completed for both NPM targets.'
 }
 
 # Entry point
 main "$@"
+
