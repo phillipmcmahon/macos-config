@@ -2,7 +2,7 @@
 #
 # Script: macos-config-sync.sh
 # Purpose: Reconcile managed macOS files with GitHub and NAS.
-# Version: 1.0.0
+# Version: 1.0.1
 # Requires: Bash 5+, Git, jq, modern rsync and adjacent lib/.
 # Documentation: docs/USER-MANUAL.md
 #
@@ -10,7 +10,7 @@
 # Runtime and configuration
 set -Eeuo pipefail
 umask 077
-readonly SCRIPT_VERSION='1.0.0'
+readonly SCRIPT_VERSION='1.0.1'
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/lib/common.sh"
 IFS=$'\n\t'
@@ -878,7 +878,8 @@ $NAS_REPO_DIR"
         log "NAS mirror already recorded for this commit and destination"
         return 0
     fi
-    mirror_repository_to_nas
+    # An offline NAS is optional here. Keep transfer errors subject to ERR.
+    mirror_repository_to_nas optional
     if [[ "$NAS_MIRROR_COMPLETE" == 1 ]]; then
         mkdir -p "$SYNC_STATE"
         printf '%s\n' "$expected" > "$receipt.tmp"
@@ -1531,8 +1532,12 @@ mirror_repository_to_nas() {
         NAS_MIRROR_COMPLETE=1
     else
         warn "NAS is unreachable (SSH host: $NAS_SSH_HOST, SMB mount: $NAS_ROOT)"
-        warn "The GitHub operation completed, but the NAS mirror was not updated."
-        return 1
+        if [[ "${1:-required}" == optional ]]; then
+            warn "The GitHub operation completed, but the NAS mirror was not updated."
+            # Leave NAS_MIRROR_COMPLETE=0 so no receipt is written and sync retries.
+            return 0
+        fi
+        die "NAS mirror was not updated. Retry nas-push when the NAS is available."
     fi
 }
 

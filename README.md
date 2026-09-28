@@ -1,6 +1,6 @@
 # macOS configuration
 
-Managed by macos-config-sync.sh 1.0.0.
+Managed by macos-config-sync.sh 1.0.1.
 
 Use `sync` for normal reconciliation. `pull` and `restore` replace managed local files.
 
