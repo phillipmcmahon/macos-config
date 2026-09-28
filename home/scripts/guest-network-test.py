@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Guest network checks for Phill's UniFi home network. Version 1.0.1.
+"""Guest network checks for Phill's UniFi home network. Version 1.0.2.
 
 Run after joining guestwifi and completing the captive portal:
     python3 guest-network-test.py
-    python3 guest-network-test.py --interface en0 --media
+    python3 guest-network-test.py --interface en0
 
 Requires Python 3.8+, curl and dig. Supports macOS and Linux (iproute2).
 No sudo, packages, configuration changes, logins or file uploads are performed.
@@ -13,6 +13,8 @@ The only persistent local change is the text report in the current directory.
 Expectations: 28 September 2026 UniFi backup and NPM screenshots, with guest
 DHCP DNS restored to 10.77.180.1 as agreed. Hypervisor is 10.77.130.20 in this
 backup. The script deliberately does not use the older .241 address.
+Updated policy: guest access to KEF TCP port 80 was removed on 28 September
+2026. All three KEF HTTP endpoints are now checked as denied on every run.
 
 PASS = a positive response supports the stated expectation.
 FAIL = a definite mismatch (including an expected service failing to respond).
@@ -54,7 +56,7 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 GUEST_NET = ipaddress.ip_network('10.77.180.0/24')
 GATEWAY = '10.77.180.1'
 DMZ = '10.77.170.50'
@@ -543,13 +545,10 @@ class Audit:
         self.result('INFO', 'Services NPM ACL boundary', '10.77.130.34:80/443 was tested as denied in section 5. Its npm-admin/npm-homestorage ACLs cannot be independently tested from guest while that network block holds')
 
     def media(self):
-        self.section('8. Optional media exceptions')
-        if not self.args.media:
-            self.result('SKIP', 'Media receivers', 'Use --media to check the three permitted KEF HTTP endpoints. Wake them first')
-            return
-        self.tcp_batch([('KEF HTTP exception', ip, 80, True, True)
+        self.section('8. Guest-to-entertainment HTTP restrictions')
+        self.tcp_batch([('KEF HTTP access denied', ip, 80, False, False)
                         for ip in ['10.77.150.40', '10.77.150.42', '10.77.150.44']])
-        self.result('INFO', 'Media verification', 'These are HTTP reachability checks only. Test discovery and playback from your normal app to verify mDNS, streaming and UDP timing')
+        self.result('INFO', 'Entertainment test scope', 'KEF TCP port 80 must be inaccessible from guest. These checks always run. Other entertainment ports, mDNS, streaming and UDP timing are outside these checks')
 
     def finish(self):
         self.section('Results')
@@ -570,7 +569,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--interface', help='Guest interface, e.g. en0. Default: current internet route interface')
     p.add_argument('--timeout', type=float, default=3, help='TCP connect timeout in seconds, 1 to 15 (default 3)')
-    p.add_argument('--media', action='store_true', help='Also check permitted KEF HTTP endpoints')
+    p.add_argument('--media', action='store_true', help='Compatibility option. KEF HTTP denial checks now always run')
     p.add_argument('--blocked-domain', action='append', default=[], metavar='HOST',
                    help='Additional domain expected to be DNS-filtered. DNS queries only. May be repeated')
     p.add_argument('--output', help='New text report path. Existing files are never overwritten')
