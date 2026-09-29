@@ -10,6 +10,7 @@ Cryptomator
 Cyberduck
 Dolphin
 Emby
+ErsatzTV-Legacy
 Firefox
 ForkLift
 Google Chrome

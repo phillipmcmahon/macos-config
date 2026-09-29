@@ -30,6 +30,8 @@ brew "jq"
 brew "openssh"
 # Pinentry for GPG on Mac
 brew "pinentry-mac"
+# Rsync for cloud storage
+brew "rclone"
 # Tools for Multiple Arcade Machine Emulator
 brew "rom-tools"
 # Utility that provides fast incremental file transfer
