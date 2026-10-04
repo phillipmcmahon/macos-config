@@ -10,6 +10,8 @@ brew "bitwarden-cli"
 brew "coreutils"
 # Get a file from an HTTP, HTTPS or FTP server
 brew "curl"
+# Command-line DNS Client for Humans
+brew "doggo"
 # Identify or delete duplicate files
 brew "fdupes"
 # Play, record, convert, and stream select audio and video codecs
@@ -26,10 +28,14 @@ brew "gnupg"
 brew "gpgme"
 # Lightweight and flexible command-line JSON processor
 brew "jq"
+# Interpreted, interactive, object-oriented programming language
+brew "python@3.14"
 # OpenBSD freely-licensed SSH connectivity tools
 brew "openssh"
 # Pinentry for GPG on Mac
 brew "pinentry-mac"
+# Execute binaries from Python packages in isolated environments
+brew "pipx"
 # Rsync for cloud storage
 brew "rclone"
 # Tools for Multiple Arcade Machine Emulator
@@ -68,6 +74,7 @@ cask "dolphin@dev"
 cask "emby"
 # Web browser
 cask "firefox"
+cask "font-inter"
 # Finder replacement and FTP, SFTP, WebDAV and Amazon s3 client
 cask "forklift"
 # Web browser

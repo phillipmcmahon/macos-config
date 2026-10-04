@@ -8,6 +8,7 @@ Bitwarden
 Citrix Workspace
 Cryptomator
 Cyberduck
+Deskflow
 Dolphin
 Emby
 ErsatzTV-Legacy
@@ -47,10 +48,12 @@ SMBMounter
 SoundSource
 Spotify
 Steam
+Synergy Dragon
 Tailscale
 Task Manager TMOG
 Transmit
 UniFi Endpoint
 VLC
+WiFiman Desktop
 ZoomVDI
 ZoomVDIUninstaller

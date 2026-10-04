@@ -14,3 +14,4 @@ export SSH_AUTH_SOCK="$HOME/.bitwarden-ssh-agent.sock"
 
 command -v gpgconf >/dev/null && gpgconf --launch gpg-agent
 . "/Users/phillipmcmahon/.acme.sh/acme.sh.env"
+export PATH="${HOME}/.local/bin":${PATH}
