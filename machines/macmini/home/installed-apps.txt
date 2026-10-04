@@ -57,6 +57,7 @@ Safari
 Sentinel
 Shottr
 SMBMounter
+Sonos
 SoundSource
 SpotiFLAC-Next
 Spotify

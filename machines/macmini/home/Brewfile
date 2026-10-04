@@ -125,6 +125,8 @@ cask "plex"
 cask "rocket"
 # Screenshot measurement and annotation tool
 cask "shottr"
+# Control your Sonos system
+cask "sonos"
 # Sound and audio controller
 cask "soundsource"
 # Music streaming service
