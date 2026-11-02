@@ -1,28 +1,43 @@
+1Password
 Adguard
 AdGuard VPN
 Amphetamine
+AnyDesk
+Arpeggi
 Arq
+ArtCraft Launcher
 Audio Hijack
 AWDL Toggle
 Bitwarden
+CADCraft
 Citrix Workspace
 Cryptomator
 Cyberduck
+DeckCraft
+DeltaSnap
+DeltaSync
 Deskflow
+Dia
 Dolphin
+DS_Store Inspector
+EffectCraft
 Emby
-ErsatzTV-Legacy
+FigCraft
+FilmCraft
 Firefox
+Firewalla
 ForkLift
 Google Chrome
+GridCraft
 HandBrake
 Hazel
 Infuse
-IPTVnator
 Jabra Direct
 Jabra Firmware Update
 KeyboardCleanTool
+LightCraft
 Loopback
+MacVisor
 Microsoft 365 Copilot Shim
 Microsoft Defender Shim
 Microsoft Excel
@@ -35,25 +50,45 @@ Mimestream
 Moom
 Mp3tag
 Mullvad VPN
+Music Assistant
 NaviBeat
+NX2Apple
 OneDrive
+OpenAudible
 OpenLogi
+Parallels Desktop
 Passepartout
+PdfCraft
+Peel
 Petrichor
+PhotoCraft
+Pine Player
 Plex
+Plexamp
 PPPlayer
 Pure Paste
+Raspberry Pi Imager
 Safari
 SMBMounter
+SolidCraft
+SoundCraft
 SoundSource
 Spotify
 Steam
-Synergy Dragon
+Synergy
 Tailscale
 Task Manager TMOG
+TestFlight
 Transmit
 UniFi Endpoint
+UTM
+VectorCraft
+VeraVox
 VLC
 WiFiman Desktop
+Windows App
+WordCraft
+Xcode
+Yumibun
 ZoomVDI
 ZoomVDIUninstaller

@@ -1,11 +1,22 @@
+tap "scaleninja/tap", trusted: true
 # Bourne-Again SHell, a UNIX command interpreter
 brew "bash"
 # Cryptography and SSL/TLS Toolkit
-brew "openssl@3", link: true
+brew "openssl@4"
+# Cryptography and SSL/TLS Toolkit
+brew "openssl@3"
 # Clone of cat(1) with syntax highlighting and Git integration
 brew "bat"
+# Extremely Fast Compression algorithm
+brew "lz4"
+# Zstandard is a real-time compression algorithm
+brew "zstd"
 # Secure and free password manager for all of your devices
 brew "bitwarden-cli"
+# Vector graphics library with cross-device output support
+brew "cairo"
+# Cross-platform make
+brew "cmake"
 # GNU File, Shell, and Text utilities
 brew "coreutils"
 # Get a file from an HTTP, HTTPS or FTP server
@@ -22,18 +33,26 @@ brew "flac"
 brew "get_iplayer"
 # GitHub command-line tool
 brew "gh"
+# Distributed revision control system
+brew "git"
 # GNU Privacy Guard (OpenPGP)
 brew "gnupg"
+# Open source programming language to build simple/reliable/efficient software
+brew "go"
 # Library access to GnuPG
 brew "gpgme"
 # Lightweight and flexible command-line JSON processor
 brew "jq"
 # Interpreted, interactive, object-oriented programming language
 brew "python@3.14"
+# Small build system for use with gyp or CMake
+brew "ninja"
 # OpenBSD freely-licensed SSH connectivity tools
 brew "openssh"
 # Pinentry for GPG on Mac
 brew "pinentry-mac"
+# Interpreted, interactive, object-oriented programming language
+brew "python@3.15"
 # Execute binaries from Python packages in isolated environments
 brew "pipx"
 # Rsync for cloud storage
@@ -42,12 +61,16 @@ brew "rclone"
 brew "rom-tools"
 # Utility that provides fast incremental file transfer
 brew "rsync"
+# Performing reflection and disassembling SPIR-V
+brew "spirv-cross"
 # Terminal multiplexer
 brew "tmux"
 # Upgrade all the things
 brew "topgrade"
 # Sends magic packets to wake up network-devices
 brew "wakeonlan"
+# Generate your Xcode project from a spec file and your folder structure
+brew "xcodegen"
 # Tool for managing your YubiKey configuration
 brew "ykman"
 # Feature-rich command-line audio/video downloader
@@ -56,6 +79,8 @@ brew "yt-dlp"
 cask "adguard"
 # VPN for privacy and security
 cask "adguard-vpn"
+# Android SDK component
+cask "android-platform-tools"
 # Multi-cloud backup application
 cask "arq"
 # Records audio from any application
@@ -68,8 +93,12 @@ cask "citrix-workspace"
 cask "cryptomator"
 # Server and cloud storage browser
 cask "cyberduck"
+# Rsync GUI to compare directories and sync files
+cask "scaleninja/tap/deltasync"
 # Emulator to play GameCube and Wii games
 cask "dolphin@dev"
+# Developer platform
+cask "dotnet-sdk"
 # Client for emby media server
 cask "emby"
 # Web browser
@@ -83,8 +112,6 @@ cask "google-chrome"
 cask "handbrake-app"
 # Automated organisation
 cask "hazel"
-# Open Source m3u, m3u8 player
-cask "iptvnator"
 # Blocks all Keyboard and TouchBar input
 cask "keyboardcleantool"
 # Cable-free audio router
@@ -99,6 +126,8 @@ cask "moom"
 cask "mp3tag"
 # VPN client
 cask "mullvad-vpn"
+# Audiobook manager for Audible users
+cask "openaudible"
 # Local-first alternative to Logitech Options+ for HID++ devices
 cask "openlogi"
 # Home media player
@@ -115,3 +144,4 @@ cask "transmit"
 cask "unifi-identity-endpoint"
 # Multimedia player
 cask "vlc"
+go "github.com/boostsecurityio/emBarrass/cmd/embarass"

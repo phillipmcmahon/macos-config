@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Script: cert-manage.sh
-# Purpose: Issue or renew configured RSA 4096 certificates and export verified PEM files.
-# Version: 1.0.1
+# Purpose: Issue or renew configured RSA 4096 or ECDSA P-256 certificates and export verified PEM files.
+# Version: 1.1.0
 # Requires: Bash 5+, OpenSSL 3+, acme.sh and adjacent lib/common.sh.
 # Documentation: docs/cert-manage-user-manual.md or run with --help.
 #
@@ -11,7 +11,7 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-readonly SCRIPT_VERSION='1.0.1'
+readonly SCRIPT_VERSION='1.1.0'
 readonly VERSION="$SCRIPT_VERSION"
 readonly SCRIPT_NAME="${0##*/}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -24,13 +24,19 @@ for helper in load_config log ok die require_cmds reject_symlinks lock_acquire l
     declare -F "$helper" > /dev/null || { printf 'ERROR Missing helper: %s\n' "$helper" >&2; exit 1; }
 done
 unset helper
-readonly CONFIG_KEYS='ACME_HOME OUTPUT_ROOT CERT_CONFIG_DIR DNS_SLEEP'
-readonly CERT_CONFIG_KEYS='DOMAIN CERT_NAMES'
+readonly CONFIG_KEYS='ACME_HOME OUTPUT_ROOT CERT_CONFIG_DIR DNS_SLEEP KEY_TYPE'
+readonly CERT_CONFIG_KEYS='DOMAIN CERT_NAMES KEY_TYPE'
 readonly CA_URL='https://acme-v02.api.letsencrypt.org/directory'
 ACME_HOME="$HOME/.acme.sh"
 OUTPUT_ROOT="$HOME/certificates"
 CERT_CONFIG_DIR="$SCRIPT_DIR/config/certificates"
 DNS_SLEEP=300
+KEY_TYPE='rsa-4096'
+DEFAULT_KEY_TYPE='rsa-4096'
+KEY_TYPE_OVERRIDE=''
+KEY_LENGTH='4096'
+STATE_SUFFIX=''
+ECC_ARGS=()
 CONFIG_FILE="$SCRIPT_DIR/config/cert-manage.conf"
 CONFIG_EXPLICIT=0
 SELECTED_DOMAIN=''
@@ -42,6 +48,7 @@ EXPORT_ONLY=0
 PROMPT_CREDENTIALS=0
 STAGING=''
 DOMAIN=''
+ACME_DOMAIN=''
 CERT_NAMES=()
 DESIRED_NAMES=''
 ACTION=''
@@ -55,10 +62,15 @@ usage() {
 $SCRIPT_NAME $SCRIPT_VERSION
 Usage: $SCRIPT_NAME [--domain DOMAIN | --all] [OPTIONS]
 
-Manage RSA 4096 certificates using Let’s Encrypt and ClouDNS DNS validation.
+Manage RSA 4096 or ECDSA P-256 certificates using Let’s Encrypt and ClouDNS DNS validation.
 Default: dry-run of all configured certificates. No acme.sh calls in dry-run.
 Config SAN additions/removals trigger replacement issuance with --apply.
 Unchanged certificates use acme.sh renewal timing. Reordering has no effect.
+DOMAIN identifies the config and export folder. Only CERT_NAMES are issued.
+acme.sh uses DOMAIN if listed, otherwise the alphabetically first SAN.
+Changing that primary name uses a different acme.sh state directory.
+KEY_TYPE can be rsa-4096 (default) or ecdsa-256 in shared or per-cert config.
+Per-cert KEY_TYPE overrides the shared default. --key-type overrides both.
 
 Options:
   --domain DOMAIN      Process one domain (config filename DOMAIN.conf)
@@ -68,6 +80,7 @@ Options:
   --acme-home PATH     acme.sh installation and state (default: ~/.acme.sh)
   --output-root PATH   Export root (default: ~/certificates)
   --dns-sleep SECONDS  DNS propagation wait (default: 300)
+  --key-type TYPE      Override key type: rsa-4096 or ecdsa-256
   --apply              Perform issuance/renewal and verified export
   -n, --dry-run        Show decisions only (default)
   --force              Force renewal with --apply
@@ -77,9 +90,10 @@ Options:
   --version            Show version
   -h, --help           Show help
 
-Exports: OUTPUT_ROOT/DOMAIN/letsencrypt/rsa-4096/
+Exports: OUTPUT_ROOT/DOMAIN/letsencrypt/KEY_TYPE/
   fullchain.pem, certificate.pem, chain.pem, private.key, private-pkcs8.pem
-UniFi import: fullchain.pem and private-pkcs8.pem.
+Import files: fullchain.pem and private-pkcs8.pem.
+Switching key type uses separate acme.sh state and a separate export folder.
 
 Uses ClouDNS credentials already saved by acme.sh or exported in the environment.
 Existing acme.sh hooks and install targets may run during renewal/installation.
@@ -113,6 +127,16 @@ require_scalar() {
     [[ $declaration != 'declare -a '* && $declaration != 'declare -A '* && -n ${!1} ]] || die "$1 must be a non-empty scalar."
 }
 
+require_openssl() {
+    local openssl_version openssl_major
+    openssl_version=$(openssl version) || die 'Cannot read the OpenSSL version.'
+    if [[ $openssl_version =~ ^OpenSSL[[:space:]]+([0-9]+)\. ]]; then
+        openssl_major=${BASH_REMATCH[1]}
+        if ((10#$openssl_major >= 3)); then return 0; fi
+    fi
+    die "OpenSSL 3.0 or newer is required (found: $openssl_version)."
+}
+
 valid_name() {
     local name=$1 label
     local -a labels=()
@@ -132,7 +156,7 @@ read_configuration() {
     while (($#)); do
         case $1 in
             --help | -h | --version) return ;;
-            --config | --config-dir | --acme-home | --output-root | --dns-sleep | --domain | --log-file)
+            --config | --config-dir | --acme-home | --output-root | --dns-sleep | --domain | --log-file | --key-type)
                 (($# >= 2)) && [[ -n $2 && $2 != --* ]] || die "Missing value for $1"
                 if [[ $1 == --config ]]; then CONFIG_FILE=$2; CONFIG_EXPLICIT=1; fi
                 shift ;;
@@ -145,16 +169,20 @@ read_configuration() {
         return 0
     fi
     load_config "$CONFIG_FILE" "$CONFIG_KEYS" || die "Cannot load config: $CONFIG_FILE"
-    for key in ACME_HOME OUTPUT_ROOT CERT_CONFIG_DIR DNS_SLEEP; do require_scalar "$key"; done
+    for key in ACME_HOME OUTPUT_ROOT CERT_CONFIG_DIR DNS_SLEEP KEY_TYPE; do require_scalar "$key"; done
 }
 
 load_certificate() {
     local path=$1 name declaration
     DOMAIN=''
+    KEY_TYPE=$DEFAULT_KEY_TYPE
     unset CERT_NAMES
     load_config "$path" "$CERT_CONFIG_KEYS" || die "Cannot load certificate config: $path"
     require_scalar DOMAIN
-    valid_name "$DOMAIN" && [[ $DOMAIN != \*.* ]] || die "Invalid primary domain: $DOMAIN"
+    require_scalar KEY_TYPE
+    if [[ -n $KEY_TYPE_OVERRIDE ]]; then KEY_TYPE=$KEY_TYPE_OVERRIDE; fi
+    configure_key_type
+    valid_name "$DOMAIN" && [[ $DOMAIN != \*.* ]] || die "Invalid configuration domain: $DOMAIN"
     [[ ${path##*/} == "$DOMAIN.conf" ]] || die "Config filename must be $DOMAIN.conf"
     declaration=$(declare -p CERT_NAMES 2>/dev/null) || die "Missing CERT_NAMES in $path"
     [[ $declaration == 'declare -a '* && ${#CERT_NAMES[@]} -gt 0 ]] || die 'CERT_NAMES must be a non-empty array.'
@@ -162,12 +190,15 @@ load_certificate() {
         valid_name "$name" || die "Invalid SAN: $name (use lower-case ASCII or punycode)."
     done
     DESIRED_NAMES=$(normalise_names "${CERT_NAMES[@]}")
-    grep -Fxq -- "$DOMAIN" <<< "$DESIRED_NAMES" || die "CERT_NAMES must include $DOMAIN"
-    # Keep the primary name first for acme.sh identity, then sort the other names.
-    CERT_NAMES=("$DOMAIN")
-    while IFS= read -r name; do [[ $name == "$DOMAIN" ]] || CERT_NAMES+=("$name"); done <<< "$DESIRED_NAMES"
-    STATE_DIR="$ACME_HOME/$DOMAIN"
-    OUTPUT_DIR="$OUTPUT_ROOT/$DOMAIN/letsencrypt/rsa-4096"
+    # DOMAIN names the config/export group, not a mandatory certificate SAN.
+    # Preserve the previous acme.sh identity when DOMAIN is explicitly requested.
+    # Otherwise use a deterministic requested SAN so reordering has no effect.
+    ACME_DOMAIN=${DESIRED_NAMES%%$'\n'*}
+    if grep -Fxq -- "$DOMAIN" <<< "$DESIRED_NAMES"; then ACME_DOMAIN=$DOMAIN; fi
+    CERT_NAMES=("$ACME_DOMAIN")
+    while IFS= read -r name; do [[ $name == "$ACME_DOMAIN" ]] || CERT_NAMES+=("$name"); done <<< "$DESIRED_NAMES"
+    STATE_DIR="$ACME_HOME/$ACME_DOMAIN$STATE_SUFFIX"
+    OUTPUT_DIR="$OUTPUT_ROOT/$DOMAIN/letsencrypt/$KEY_TYPE"
     reject_symlinks "$STATE_DIR" || die 'Unsafe acme.sh state path.'
     reject_symlinks "$OUTPUT_DIR" || die 'Unsafe output path.'
 }
@@ -181,7 +212,7 @@ read_state_value() {
         value=${line#*=}
         [[ $value != "("* ]] || die "Unsupported state value for $key"
         if [[ $value == \"*\" || $value == \'*\' ]]; then value=${value:1:${#value}-2}; fi
-    done < "$STATE_DIR/$DOMAIN.conf"
+    done < "$STATE_DIR/$ACME_DOMAIN.conf"
     ((count <= 1)) || die "Duplicate state field: $key"
     printf '%s\n' "$value"
 }
@@ -193,47 +224,67 @@ certificate_names() {
         tr '[:upper:]' '[:lower:]' | sort -u
 }
 
+configure_key_type() {
+    ECC_ARGS=()
+    case $KEY_TYPE in
+        rsa-4096) KEY_LENGTH=4096; STATE_SUFFIX='' ;;
+        ecdsa-256) KEY_LENGTH=ec-256; STATE_SUFFIX=_ecc; ECC_ARGS=(--ecc) ;;
+        *) die "Unsupported KEY_TYPE: $KEY_TYPE (use rsa-4096 or ecdsa-256)." ;;
+    esac
+}
+
 rsa_4096() {
     local text
     text=$(openssl rsa -pubin -in /dev/stdin -text -noout 2>/dev/null) || return 1
     [[ $text == *'Public-Key: (4096 bit)'* ]]
 }
 
+key_matches_type() {
+    local text
+    case $KEY_TYPE in
+        rsa-4096) rsa_4096 ;;
+        ecdsa-256)
+            text=$(openssl ec -pubin -in /dev/stdin -text -noout 2>/dev/null) || return 1
+            [[ $text == *'ASN1 OID: prime256v1'* ]] ;;
+        *) return 1 ;;
+    esac
+}
+
 determine_action() {
     local saved_main saved_alt saved_names saved_key saved_ca saved_dns cert_names item
     local -a alt_names=() dns_methods=()
-    ACTION=issue REASON='No existing RSA certificate.'
-    if [[ -f $STATE_DIR/$DOMAIN.conf ]]; then
-        [[ ! -L $STATE_DIR/$DOMAIN.conf ]] || die 'Refusing symlink certificate state.'
+    ACTION=issue REASON="No existing $KEY_TYPE certificate."
+    if [[ -f $STATE_DIR/$ACME_DOMAIN.conf ]]; then
+        [[ ! -L $STATE_DIR/$ACME_DOMAIN.conf ]] || die 'Refusing symlink certificate state.'
         ACTION=reissue REASON='Incomplete existing certificate state.'
         saved_main=$(read_state_value Le_Domain)
         saved_alt=$(read_state_value Le_Alt)
         saved_key=$(read_state_value Le_Keylength)
         saved_ca=$(read_state_value Le_API)
         saved_dns=$(read_state_value Le_Webroot)
-        [[ $saved_main == "$DOMAIN" ]] || die 'Existing acme.sh primary domain does not match.'
+        [[ $saved_main == "$ACME_DOMAIN" ]] || die 'Existing acme.sh primary domain does not match.'
         if [[ -n $saved_ca && $saved_ca != "$CA_URL" ]]; then die "Existing certificate uses another CA. Use a separate ACME_HOME: $DOMAIN"; fi
         [[ -n $saved_dns ]] || die "Missing DNS method in existing state: $DOMAIN"
         IFS=, read -r -a dns_methods <<< "$saved_dns"
         for item in "${dns_methods[@]}"; do [[ $item == dns_cloudns ]] || die "Existing certificate does not use ClouDNS: $DOMAIN"; done
-        [[ $saved_key == 4096 ]] || die "Existing key is not configured as RSA 4096: $DOMAIN. Migrate it separately or use a separate ACME_HOME."
-        if [[ -s $STATE_DIR/$DOMAIN.cer && -s $STATE_DIR/$DOMAIN.key ]]; then
-            [[ ! -L $STATE_DIR/$DOMAIN.cer && ! -L $STATE_DIR/$DOMAIN.key ]] || die 'Refusing symlink certificate/key.'
+        [[ $saved_key == "$KEY_LENGTH" ]] || die "Existing key is not configured as $KEY_TYPE: $DOMAIN. Migrate it separately or use a separate ACME_HOME."
+        if [[ -s $STATE_DIR/$ACME_DOMAIN.cer && -s $STATE_DIR/$ACME_DOMAIN.key ]]; then
+            [[ ! -L $STATE_DIR/$ACME_DOMAIN.cer && ! -L $STATE_DIR/$ACME_DOMAIN.key ]] || die 'Refusing symlink certificate/key.'
             IFS=, read -r -a alt_names <<< "$saved_alt"
             if [[ $saved_alt == no || -z $saved_alt ]]; then alt_names=(); fi
             saved_names=$(normalise_names "$saved_main" "${alt_names[@]}")
-            cert_names=$(certificate_names "$STATE_DIR/$DOMAIN.cer") || die 'Cannot read existing certificate.'
-            openssl x509 -in "$STATE_DIR/$DOMAIN.cer" -pubkey -noout | rsa_4096 || die 'Existing certificate is not RSA 4096.'
+            cert_names=$(certificate_names "$STATE_DIR/$ACME_DOMAIN.cer") || die 'Cannot read existing certificate.'
+            openssl x509 -in "$STATE_DIR/$ACME_DOMAIN.cer" -pubkey -noout | key_matches_type || die "Existing certificate does not match $KEY_TYPE."
             if [[ $saved_names != "$DESIRED_NAMES" || $cert_names != "$DESIRED_NAMES" ]]; then
                 REASON='Configured SANs differ from the certificate or saved renewal settings.'
-            elif ! openssl x509 -in "$STATE_DIR/$DOMAIN.cer" -checkend 0 -noout > /dev/null; then
+            elif ! openssl x509 -in "$STATE_DIR/$ACME_DOMAIN.cer" -checkend 0 -noout > /dev/null; then
                 REASON='Existing certificate has expired.'
             else
                 ACTION=renew REASON='SANs match. acme.sh will check whether renewal is due.'
             fi
         fi
     elif [[ -e $STATE_DIR ]]; then
-        die "RSA state directory exists without its config. Inspect before continuing: $STATE_DIR"
+        die "Certificate state directory exists without its config. Inspect before continuing: $STATE_DIR"
     fi
     if ((EXPORT_ONLY)); then
         [[ $ACTION == renew ]] || die "Cannot export $DOMAIN: $REASON"
@@ -246,7 +297,7 @@ determine_action() {
 validate_export() {
     local cert_hash key_hash leaf_hash full_hash names
     openssl pkey -in "$STAGING/private.key" -check -noout > /dev/null
-    openssl pkey -in "$STAGING/private.key" -pubout | rsa_4096 || die 'Exported key is not RSA 4096.'
+    openssl pkey -in "$STAGING/private.key" -pubout | key_matches_type || die "Exported key does not match $KEY_TYPE."
     openssl x509 -in "$STAGING/certificate.pem" -checkend 0 -noout > /dev/null || die 'Exported certificate has expired.'
     cert_hash=$(openssl x509 -in "$STAGING/certificate.pem" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256)
     key_hash=$(openssl pkey -in "$STAGING/private-pkcs8.pem" -pubout -outform DER | openssl dgst -sha256)
@@ -259,7 +310,7 @@ validate_export() {
     openssl verify -purpose sslserver -untrusted "$STAGING/chain.pem" "$STAGING/certificate.pem" > /dev/null || die 'Certificate does not verify against the OpenSSL trust store.'
     names=$(certificate_names "$STAGING/certificate.pem") || die 'Cannot read exported SANs.'
     [[ $names == "$DESIRED_NAMES" ]] || die 'Exported SANs do not exactly match configuration.'
-    ok 'RSA 4096, key match, trusted chain, validity and exact SAN set verified.'
+    ok "$KEY_TYPE, key match, trusted chain, validity and exact SAN set verified."
 }
 
 export_certificate() {
@@ -270,7 +321,7 @@ export_certificate() {
     for file in private.key certificate.pem chain.pem fullchain.pem private-pkcs8.pem; do
         [[ ! -L $export_dir/$file && ! -L $OUTPUT_DIR/$file ]] || die "Refusing symlink export: $file"
     done
-    "$ACME_HOME/acme.sh" --install-cert --home "$ACME_HOME" -d "$DOMAIN" \
+    "$ACME_HOME/acme.sh" --install-cert --home "$ACME_HOME" -d "$ACME_DOMAIN" "${ECC_ARGS[@]}" \
         --key-file "$export_dir/private.key" --cert-file "$export_dir/certificate.pem" \
         --ca-file "$export_dir/chain.pem" --fullchain-file "$export_dir/fullchain.pem"
     STAGING=$(mktemp -d "$OUTPUT_DIR/.verified-export.XXXXXXXX")
@@ -298,10 +349,11 @@ export_certificate() {
 main() {
     local file name rc key value
     local -a files=() args=()
+    local -A primary_configs=()
     read_configuration "$@"
     while (($#)); do
         case $1 in
-            --config | --config-dir | --acme-home | --output-root | --dns-sleep | --domain | --log-file)
+            --config | --config-dir | --acme-home | --output-root | --dns-sleep | --domain | --log-file | --key-type)
                 (($# >= 2)) && [[ -n $2 && $2 != --* ]] || die "Missing value for $1"
                 case $1 in
                     --config) ;;
@@ -309,6 +361,7 @@ main() {
                     --acme-home) ACME_HOME=$2 ;;
                     --output-root) OUTPUT_ROOT=$2 ;;
                     --dns-sleep) DNS_SLEEP=$2 ;;
+                    --key-type) KEY_TYPE_OVERRIDE=$2 ;;
                     --domain) SELECTED_DOMAIN=$2 ;;
                     --log-file) LOG_FILE=$2 ;;
                 esac
@@ -325,11 +378,15 @@ main() {
         esac
         shift
     done
+    require_scalar KEY_TYPE
+    DEFAULT_KEY_TYPE=$KEY_TYPE
+    if [[ -n $KEY_TYPE_OVERRIDE ]]; then KEY_TYPE=$KEY_TYPE_OVERRIDE; fi
+    configure_key_type
     ((!(FORCE && EXPORT_ONLY))) || die '--force and --export-only conflict.'
     [[ -z $SELECTED_DOMAIN || $ALL == 0 ]] || die '--domain and --all conflict.'
     [[ $DNS_SLEEP =~ ^[1-9][0-9]*$ ]] || die 'DNS_SLEEP must be a positive integer.'
     require_cmds openssl sort tr sed grep mkdir mktemp cp mv chmod stat cat rm rmdir
-    [[ $(openssl version) == 'OpenSSL 3.'* ]] || die 'OpenSSL 3.x from Homebrew is required.'
+    require_openssl
     for key in ACME_HOME OUTPUT_ROOT CERT_CONFIG_DIR; do
         value=$(absolute_path "${!key}" "$SCRIPT_DIR")
         printf -v "$key" '%s' "$value"
@@ -355,8 +412,14 @@ main() {
     for file in "${files[@]}"; do
         [[ -f $file ]] || die "Certificate config not found: $file"
         load_certificate "$file"
+        if [[ -n ${primary_configs[$STATE_DIR]:-} ]]; then
+            die "Configs share acme.sh primary name $ACME_DOMAIN ($KEY_TYPE): ${primary_configs[$STATE_DIR]} and $file. Use separate ACME_HOME directories."
+        fi
+        primary_configs[$STATE_DIR]=$file
         determine_action
         log "$DOMAIN: $ACTION. $REASON"
+        log "  acme.sh primary: $ACME_DOMAIN"
+        log "  Key type: $KEY_TYPE"
         for name in "${CERT_NAMES[@]}"; do log "  SAN: $name"; done
         log "  Export: $OUTPUT_DIR"
     done
@@ -381,7 +444,7 @@ main() {
         rc=0
         case $ACTION in
             issue | reissue)
-                args=(--issue --home "$ACME_HOME" --server letsencrypt --dns dns_cloudns --dnssleep "$DNS_SLEEP" --keylength 4096)
+                args=(--issue --home "$ACME_HOME" --server letsencrypt --dns dns_cloudns --dnssleep "$DNS_SLEEP" --keylength "$KEY_LENGTH")
                 for name in "${CERT_NAMES[@]}"; do args+=(-d "$name"); done
                 # Force only a deliberate replacement, or an explicit --force request.
                 if [[ $ACTION == reissue || $FORCE == 1 ]]; then args+=(--force); fi
@@ -389,7 +452,7 @@ main() {
                 ((rc == 0)) || die "Issuance failed for $DOMAIN (exit $rc). Verified exports were not changed."
                 ;;
             renew)
-                args=(--renew --home "$ACME_HOME" --server letsencrypt -d "$DOMAIN" --dnssleep "$DNS_SLEEP")
+                args=(--renew --home "$ACME_HOME" --server letsencrypt -d "$ACME_DOMAIN" --dnssleep "$DNS_SLEEP" "${ECC_ARGS[@]}")
                 if ((FORCE)); then args+=(--force); fi
                 "$ACME_HOME/acme.sh" "${args[@]}" || rc=$?
                 case $rc in

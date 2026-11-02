@@ -2,7 +2,7 @@
 #
 # Script: cert-deploy-npm.sh
 # Purpose: Deploy verified RSA 4096 PEM files to DMZ and services NPM over SSH.
-# Version: 1.1.0
+# Version: 1.1.1
 # Requires: Bash 5+, OpenSSL 3+, ssh, scp and adjacent lib/common.sh.
 # Documentation: docs/cert-deploy-npm-user-manual.md or run with --help.
 #
@@ -11,7 +11,7 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-readonly SCRIPT_VERSION='1.1.0'
+readonly SCRIPT_VERSION='1.1.1'
 readonly VERSION="$SCRIPT_VERSION"
 readonly SCRIPT_NAME="${0##*/}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -82,6 +82,16 @@ EOF
 }
 
 # Helpers
+require_openssl() {
+    local openssl_version openssl_major
+    openssl_version=$(openssl version) || die 'Cannot read the OpenSSL version.'
+    if [[ $openssl_version =~ ^OpenSSL[[:space:]]+([0-9]+)\. ]]; then
+        openssl_major=${BASH_REMATCH[1]}
+        if ((10#$openssl_major >= 3)); then return 0; fi
+    fi
+    die "OpenSSL 3.0 or newer is required (found: $openssl_version)."
+}
+
 absolute_path() {
     local path=$1 base=$2
     case $path in
@@ -199,7 +209,7 @@ main() {
         shift
     done
     require_cmds openssl ssh scp mkdir mktemp cp rm cut touch
-    [[ $(openssl version) == 'OpenSSL 3.'* ]] || die 'OpenSSL 3.x is required.'
+    require_openssl
     target_labels=('DMZ' 'services')
     target_hosts=("$NPM_HOST" "$SERVICES_NPM_HOST")
     target_containers=("$NPM_CONTAINER" "$SERVICES_NPM_CONTAINER")
@@ -248,4 +258,3 @@ main() {
 
 # Entry point
 main "$@"
-
