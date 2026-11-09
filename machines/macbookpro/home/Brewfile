@@ -47,12 +47,14 @@ brew "jq"
 brew "python@3.14"
 # Small build system for use with gyp or CMake
 brew "ninja"
+# Development kit for the Java programming language
+brew "openjdk@17"
+# Interpreted, interactive, object-oriented programming language
+brew "python@3.15"
 # OpenBSD freely-licensed SSH connectivity tools
 brew "openssh"
 # Pinentry for GPG on Mac
 brew "pinentry-mac"
-# Interpreted, interactive, object-oriented programming language
-brew "python@3.15"
 # Execute binaries from Python packages in isolated environments
 brew "pipx"
 # Rsync for cloud storage
@@ -67,6 +69,8 @@ brew "spirv-cross"
 brew "tmux"
 # Upgrade all the things
 brew "topgrade"
+# Terminal UI for WireGuard and OpenVPN with live telemetry and leak guarding
+brew "vortix"
 # Sends magic packets to wake up network-devices
 brew "wakeonlan"
 # Generate your Xcode project from a spec file and your folder structure
@@ -116,6 +120,8 @@ cask "hazel"
 cask "keyboardcleantool"
 # Cable-free audio router
 cask "loopback"
+# Native virtual machine manager for Apple Silicon Macs
+cask "scaleninja/tap/macvisor"
 # Office suite
 cask "microsoft-office-businesspro"
 # Native app email client for Gmail
@@ -144,4 +150,6 @@ cask "transmit"
 cask "unifi-identity-endpoint"
 # Multimedia player
 cask "vlc"
+# Native desktop client for WhatsApp
+cask "whatsapp@beta"
 go "github.com/boostsecurityio/emBarrass/cmd/embarass"

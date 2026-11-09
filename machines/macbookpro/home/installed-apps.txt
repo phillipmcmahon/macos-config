@@ -10,7 +10,9 @@ Audio Hijack
 AWDL Toggle
 Bitwarden
 CADCraft
+Caldera Amp
 Citrix Workspace
+Craft Anything
 Cryptomator
 Cyberduck
 DeckCraft
@@ -22,6 +24,7 @@ Dolphin
 DS_Store Inspector
 EffectCraft
 Emby
+Feishin
 FigCraft
 FilmCraft
 Firefox
@@ -38,6 +41,8 @@ KeyboardCleanTool
 LightCraft
 Loopback
 MacVisor
+MakeMKV
+MaterialCraft
 Microsoft 365 Copilot Shim
 Microsoft Defender Shim
 Microsoft Excel
@@ -85,6 +90,7 @@ UTM
 VectorCraft
 VeraVox
 VLC
+WhatsApp
 WiFiman Desktop
 Windows App
 WordCraft

@@ -62,6 +62,9 @@ ssh() {
         podman.dmz.phillipmcmahon.com)
             target_profile="DMZ"
             ;;
+        burner.dmz.phillipmcmahon.com)
+            target_profile="DMZ"
+            ;;
         *)
             command ssh "$@"
             return $?
