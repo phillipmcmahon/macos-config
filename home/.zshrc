@@ -56,13 +56,10 @@ ssh() {
     )
 
     case "$target_host" in
-        podman.services.phillipmcmahon.com)
+        *.services.phillipmcmahon.com)
             target_profile="Services"
             ;;
-        podman.dmz.phillipmcmahon.com)
-            target_profile="DMZ"
-            ;;
-        burner.dmz.phillipmcmahon.com)
+        *.dmz.phillipmcmahon.com)
             target_profile="DMZ"
             ;;
         *)

@@ -1,11 +1,11 @@
 # S3
 b78452a7dcd84e269a07c57a4cbdf282.s3
-dd7ae9cfed0b5d34b9a2a7e03514057d.s3
 
 # Media
 emby
 jellyfin
 music
+plex
 
 # Services
 moodist
@@ -13,5 +13,6 @@ ntfy
 poems
 rclone
 romm
+unifi-reader
 vault
 vpn

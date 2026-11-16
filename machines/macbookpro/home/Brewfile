@@ -116,6 +116,8 @@ cask "google-chrome"
 cask "handbrake-app"
 # Automated organisation
 cask "hazel"
+# Open Source m3u, m3u8 player
+cask "iptvnator"
 # Blocks all Keyboard and TouchBar input
 cask "keyboardcleantool"
 # Cable-free audio router

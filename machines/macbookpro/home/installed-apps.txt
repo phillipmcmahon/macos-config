@@ -35,12 +35,14 @@ GridCraft
 HandBrake
 Hazel
 Infuse
+IPTVnator
 Jabra Direct
 Jabra Firmware Update
 KeyboardCleanTool
 LightCraft
 Loopback
 MacVisor
+MailCraft
 MakeMKV
 MaterialCraft
 Microsoft 365 Copilot Shim
@@ -73,6 +75,7 @@ Plexamp
 PPPlayer
 Pure Paste
 Raspberry Pi Imager
+Rivulet
 Safari
 SMBMounter
 SolidCraft

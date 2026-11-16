@@ -1,0 +1,9 @@
+guest-network-test.py v1.0.2
+Started: 2026-11-12T23:12:17+00:00
+Read-only, IPv4 checks. Complete guest portal login before running.
+Report: /Users/phillipmcmahon/scripts/guest-network-test-20261112T231217278339.txt
+BLOCKED means no TCP connection, not proof of a particular firewall rule.
+
+1. Guest attachment and routing
+[FAIL   ] Setup/execution: Internet route does not use guest gateway 10.77.180.1. Reported gateway: 10.77.120.1
+Stopped. Correct the setup and rerun. Report: /Users/phillipmcmahon/scripts/guest-network-test-20261112T231217278339.txt

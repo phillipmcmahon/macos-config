@@ -3,9 +3,32 @@
 # bdmv2mkv.sh - Batch-remux Blu-ray BDMV folders into MKV (main feature only)
 #               using MakeMKV's command-line tool (makemkvcon). No re-encoding.
 #
-# VERSION: 1.2.1
+# VERSION: 1.3.2
 #
 # CHANGELOG
+#   1.3.2 (2026-11-10)
+#     - MakeMKV 2.0.0 hint: the crash was reproduced on Linux (user's Synology,
+#       jlesage/makemkv), so it is named as the likely cause on every platform.
+#       The NAS setup pins image jlesage/makemkv:v26.09.1 (MakeMKV 1.18.4).
+#   1.3.1 (2026-11-10)
+#     - MakeMKV 2.0.0 hint (shown only when a title scan fails) now says the
+#       crash was reported on macOS and is only a possible cause elsewhere;
+#       the NAS setup now uses the latest jlesage/makemkv image (2.0.0).
+#   1.3.0 (2026-11-10)
+#     - Synology DSM 7 support, with makemkvcon in a jlesage/makemkv Docker
+#       container via nas/makemkvcon-docker.sh (MAKEMKVCON=...). Setup and test
+#       steps: nas/README.md.
+#     - New BDMV2MKV_JAVA_CHECK (default 1). 0 skips the start-up host Java
+#       check, which is meaningless when MakeMKV runs in a container; the
+#       per-disc MSG 3344 report is unchanged.
+#     - GNU sort is also looked for at /opt/bin/sort (Entware; not on PATH in
+#       non-interactive SSH or Task Scheduler). Error message names the
+#       Entware package (coreutils-sort).
+#     - When the title scan finds nothing, the last 5 non-title lines are shown
+#       (previously MSG lines only), so errors printed by a makemkvcon wrapper
+#       are visible.
+#     - MakeMKV 2.0.0 message also names the last jlesage/makemkv image tag
+#       with 1.18.4 (v26.09.1).
 #   1.2.1 (2026-11-09)
 #     - Logs the MakeMKV version once per run, read from makemkvcon's own start-up
 #       message (MSG 1005) - makemkvcon is not run an extra time.
@@ -81,7 +104,7 @@ fi
 set -euo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.1"
+readonly VERSION="1.3.2"
 readonly PROG="${0##*/}"
 
 # ---- Tunables (environment overrides)
@@ -97,6 +120,9 @@ SPACE_HEADROOM_PCT="${BDMV2MKV_SPACE_HEADROOM_PCT:-5}"
 # of the longest title, and MakeMKV flagged none as FPL_MainFeature.
 OBFUSCATION_THRESHOLD="${BDMV2MKV_OBFUSCATION_THRESHOLD:-5}"
 OBFUSCATION_WINDOW="${BDMV2MKV_OBFUSCATION_WINDOW:-5}"
+# 1 = report the Java runtime MakeMKV is likely to use at start-up; 0 = skip
+# (e.g. makemkvcon runs in a Docker container, so host Java is irrelevant).
+JAVA_CHECK="${BDMV2MKV_JAVA_CHECK:-1}"
 
 # Folder names pruned during discovery (NAS/OS metadata, recycle bins, our temp dirs).
 # shellcheck disable=SC2016  # literal '$RECYCLE.BIN' is intended
@@ -169,6 +195,8 @@ Environment:
   BDMV2MKV_OBFUSCATION_THRESHOLD  Titles near the longest that flag a suspected
                                   fake-playlist disc (default 5)
   BDMV2MKV_OBFUSCATION_WINDOW     "Near" means within this many seconds (default 5)
+  BDMV2MKV_JAVA_CHECK           1 = report host Java at start-up, 0 = skip (default 1;
+                                use 0 when makemkvcon runs in Docker)
 
 Main feature = title MakeMKV flags FPL_MainFeature (needs Java, see README),
 otherwise the longest title.
@@ -232,7 +260,7 @@ is_positive_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
 # unprefixed one only if it really is GNU (e.g. coreutils gnubin in PATH, Linux).
 find_gnu_tool() {
     local name="$1" cand
-    for cand in "g$name" "$name"; do
+    for cand in "g$name" "$name" "/opt/bin/$name"; do   # /opt/bin: Entware (Synology), often not on PATH
         if command -v "$cand" >/dev/null 2>&1 && "$cand" --version 2>/dev/null | head -n 1 | grep -q 'GNU'; then
             command -v "$cand"
             return 0
@@ -293,7 +321,7 @@ preflight() {
     (( ${#missing[@]} == 0 )) || die "Missing required commands: ${missing[*]}"
 
     SORT_BIN="$(find_gnu_tool sort)" \
-        || die "GNU sort not found. Install GNU coreutils: brew install coreutils (provides gsort)."
+        || die "GNU sort not found. macOS: brew install coreutils (provides gsort). Synology/Entware: opkg install coreutils-sort."
 
     MAKEMKVCON_BIN="$(find_makemkvcon)" \
         || die "makemkvcon not found. Install MakeMKV (/Applications/MakeMKV.app) or set MAKEMKVCON=/path/to/makemkvcon."
@@ -420,13 +448,17 @@ select_main_title() {
         else
             error "  makemkvcon info found no titles (exit $rc). Last messages:"
         fi
-        grep '^MSG:' "$infolog" | tail -n 5 | while IFS= read -r line; do error "    $line"; done || true
+        # MSG lines plus any plain text (e.g. errors from a makemkvcon wrapper); not title data.
+        grep -Ev '^(TINFO|SINFO|CINFO|TCOUT|DRV):' "$infolog" | grep -v '^[[:space:]]*$' | tail -n 5 \
+            | while IFS= read -r line; do error "    $line"; done || true
         # MakeMKV 2.0.0 (20 Sep 2026) segfaults on unencrypted BDMV folders/ISOs
-        # (no AACS directory); 1.18.4 works. Confirmed on the user's Mac.
+        # (no AACS directory); 1.18.4 works. Confirmed on the user's Mac (arm64)
+        # and on their Synology in jlesage/makemkv (Linux).
         if [[ "$SEL_MKVVER" == 2.0.0 ]]; then
-            error "  MakeMKV 2.0.0 has a known bug: it crashes on unencrypted Blu-ray folders and ISOs (no AACS"
-            error "  directory). Install 1.18.4 from https://makemkv.com/download/old/ (settings and key are kept)"
-            error "  and turn off update checks in MakeMKV > Preferences until a fixed release is out."
+            error "  Likely cause: MakeMKV 2.0.0 crashes on unencrypted Blu-ray folders and ISOs (no AACS"
+            error "  directory), on macOS and Linux. Mac: install 1.18.4 from https://makemkv.com/download/old/"
+            error "  (settings and key are kept) and turn off update checks in MakeMKV > Preferences."
+            error "  Docker: use image jlesage/makemkv:v26.09.1, the last with MakeMKV 1.18.4."
         fi
         # MSG:5053 = MakeMKV asking to start its 30-day evaluation, which makemkvcon
         # cannot answer. Mention it, but do not present it as the cause of a crash.
@@ -722,7 +754,11 @@ main() {
     info "Source: $SRC"
     info "Destination: $DEST"
     info "makemkvcon: $MAKEMKVCON_BIN"
-    check_java
+    if [[ "$JAVA_CHECK" == 0 ]]; then
+        info "Java check skipped (BDMV2MKV_JAVA_CHECK=0); each disc logs the Java MakeMKV used, if any."
+    else
+        check_java
+    fi
 
     local roots=() r
     while IFS= read -r -d '' r; do roots+=("$r"); done < <(discover_discs)
