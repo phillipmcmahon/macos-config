@@ -38,6 +38,7 @@ Infuse
 IPTVnator
 Jabra Direct
 Jabra Firmware Update
+Jellyfin Desktop
 KeyboardCleanTool
 LightCraft
 Loopback
@@ -99,5 +100,6 @@ Windows App
 WordCraft
 Xcode
 Yumibun
+zoom.us
 ZoomVDI
 ZoomVDIUninstaller
