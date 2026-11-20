@@ -1,4 +1,6 @@
 tap "scaleninja/tap", trusted: true
+# Simple, modern, secure file encryption
+brew "age"
 # Bourne-Again SHell, a UNIX command interpreter
 brew "bash"
 # Cryptography and SSL/TLS Toolkit

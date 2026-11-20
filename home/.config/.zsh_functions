@@ -1,5 +1,12 @@
 # ============================================================================
-# zsh function library - v2.18
+# zsh function library - v2.19
+#
+# v2.19:
+#   - ageto(): new function to encrypt a file with age to an SSH public key
+#     (ssh-ed25519 or ssh-rsa) without importing into GPG or the age keyring.
+#     Output is <file>.age, mode 0600; refuses to overwrite. Prints the
+#     recipient's key fingerprint for out-of-band verification. Requires age
+#     and ssh-keygen.
 #
 # v2.18:
 #   - clearxattr(): new function to recursively clear all extended attributes
@@ -494,6 +501,81 @@ encrypt() {
     echo "$1 -> $output"
 }
 
+# ageto <ssh-public-key> <file> [-a]
+# Encrypt a file with age to an ssh-ed25519 or ssh-rsa public key, without
+# touching the GPG keyring. Output is <file>.age beside the original, mode
+# 0600, and an existing file or symbolic link is never overwritten. The
+# optional -a produces ASCII-armoured output. The key's fingerprint is
+# printed so it can be confirmed with the recipient out of band.
+#
+# The key is passed to age inline (-r), so nothing is written to disk. The
+# ciphertext is created through a noclobber redirection (O_EXCL); a partial
+# output is removed on failure, which is safe because that create proved
+# this invocation made the file. Requires age and ssh-keygen.
+ageto() {
+    emulate -L zsh
+
+    _require "$1" "ssh-public-key" || return 1
+    _require "$2" "file" || return 1
+    _require_cmd age || return 1
+    _require_cmd ssh-keygen || return 1
+
+    (( $# <= 3 )) || {
+        echo "usage: ageto <ssh-public-key> <file> [-a]" >&2
+        return 1
+    }
+
+    local key="$1" file="$2"
+    local -a armor=()
+
+    if [[ -n "${3-}" ]]; then
+        [[ "$3" == "-a" ]] || {
+            echo "unknown option: $3 (only -a is supported)" >&2
+            return 1
+        }
+        armor=(-a)
+    fi
+
+    # Single line, supported type only. Also guarantees $key cannot be
+    # parsed by age as a flag.
+    [[ "$key" != *[$'\r\n']* && "$key" == (ssh-ed25519|ssh-rsa)\ * ]] || {
+        echo "expected a single-line ssh-ed25519 or ssh-rsa public key" >&2
+        return 1
+    }
+
+    local fingerprint
+    fingerprint="$(print -r -- "$key" | command ssh-keygen -lf - 2>/dev/null)" || {
+        echo "invalid SSH public key" >&2
+        return 1
+    }
+
+    [[ -f "$file" ]] || {
+        echo "no such regular file: $file" >&2
+        return 1
+    }
+
+    local output="${file}.age"
+
+    if _path_exists "$output"; then
+        echo "refusing to overwrite existing: $output" >&2
+        return 1
+    fi
+
+    echo "recipient: $fingerprint"
+
+    # noclobber makes the redirection an O_EXCL create, so nothing is
+    # overwritten even if the output appears between the check and here.
+    setopt localoptions noclobber
+    if ! command age "${armor[@]}" -r "$key" < "$file" > "$output"; then
+        command rm -f -- "$output" 2>/dev/null
+        echo "encryption failed: $file" >&2
+        return 1
+    fi
+
+    command chmod 600 "$output" 2>/dev/null
+    echo "$file -> $output"
+}
+
 # decrypt <file>
 # Decrypt a .asc, .gpg, .pgp, or timestamped .<timestamp>.asc file.
 # Plaintext is written to a mode-0600 temporary file in the destination
@@ -880,7 +962,7 @@ openpgpkey_lookup_validate() {
     local lower_part hash qname tmp_file
     lower_part="$(printf '%s' "$local_part" | command tr '[:upper:]' '[:lower:]')" \
         || return 1
-    hash="$(printf '%s' "$lower_part" | command sha256sum | command cut -c1-56)" \
+    hash="$(printf '%s' "$local_part" | command sha256sum | command cut -c1-56)" \
         || return 1
 
     [[ ${#hash} -eq 56 ]] || {
