@@ -1,5 +1,14 @@
 # ============================================================================
-# zsh function library - v2.19
+# zsh function library - v2.20
+#
+# v2.20:
+#   - ageto(): now accepts a directory as well as a regular file. A directory
+#     is archived with zip into a private mode-0700 temporary directory under
+#     ${TMPDIR:-/tmp} and encrypted from there, so no intermediate .zip is
+#     ever written next to the original. Output is <dir>.zip.age. The
+#     plaintext archive is removed immediately on success and via an EXIT
+#     trap on failure. Requires zip and mktemp only when a directory is
+#     passed.
 #
 # v2.19:
 #   - ageto(): new function to encrypt a file with age to an SSH public key
@@ -501,31 +510,41 @@ encrypt() {
     echo "$1 -> $output"
 }
 
-# ageto <ssh-public-key> <file> [-a]
-# Encrypt a file with age to an ssh-ed25519 or ssh-rsa public key, without
-# touching the GPG keyring. Output is <file>.age beside the original, mode
-# 0600, and an existing file or symbolic link is never overwritten. The
-# optional -a produces ASCII-armoured output. The key's fingerprint is
-# printed so it can be confirmed with the recipient out of band.
+# ageto <ssh-public-key> <file|directory> [-a]
+# Encrypt a file or directory with age to an ssh-ed25519 or ssh-rsa public
+# key, without touching the GPG keyring. The key's fingerprint is printed so
+# it can be confirmed with the recipient out of band. The optional -a
+# produces ASCII-armoured output.
 #
-# The key is passed to age inline (-r), so nothing is written to disk. The
-# ciphertext is created through a noclobber redirection (O_EXCL); a partial
-# output is removed on failure, which is safe because that create proved
-# this invocation made the file. Requires age and ssh-keygen.
+# A regular file is encrypted directly, producing <file>.age.
+# A directory is first archived with zip, producing <dir>.zip.age. The
+# intermediate archive is written into a private mode-0700 temporary
+# directory under ${TMPDIR:-/tmp} and removed afterwards, so it never
+# appears in the working directory, never lands on a network share, and
+# cannot collide with, or be mistaken for, an existing file. Requires zip
+# and mktemp only when a directory is passed.
+#
+# Output is mode 0600 beside the original; an existing file or symbolic link
+# is never overwritten. The key is passed to age inline (-r), so nothing
+# besides the ciphertext is written to disk. For regular files the ciphertext
+# is created through a noclobber redirection (O_EXCL); a partial output is
+# removed on failure, which is safe because that create proved this
+# invocation made the file. Requires age and ssh-keygen.
 ageto() {
     emulate -L zsh
+    setopt localtraps
 
     _require "$1" "ssh-public-key" || return 1
-    _require "$2" "file" || return 1
+    _require "$2" "file or directory" || return 1
     _require_cmd age || return 1
     _require_cmd ssh-keygen || return 1
 
     (( $# <= 3 )) || {
-        echo "usage: ageto <ssh-public-key> <file> [-a]" >&2
+        echo "usage: ageto <ssh-public-key> <file|directory> [-a]" >&2
         return 1
     }
 
-    local key="$1" file="$2"
+    local key="$1" target="${2%/}"
     local -a armor=()
 
     if [[ -n "${3-}" ]]; then
@@ -549,31 +568,105 @@ ageto() {
         return 1
     }
 
-    [[ -f "$file" ]] || {
-        echo "no such regular file: $file" >&2
+    # --- Regular file path ---------------------------------------------------
+    if [[ -f "$target" ]]; then
+        local output="${target}.age"
+
+        if _path_exists "$output"; then
+            echo "refusing to overwrite existing: $output" >&2
+            return 1
+        fi
+
+        echo "recipient: $fingerprint"
+
+        # noclobber makes the redirection an O_EXCL create, so nothing is
+        # overwritten even if the output appears between the check and here.
+        setopt localoptions noclobber
+        if ! command age "${armor[@]}" -r "$key" < "$target" > "$output"; then
+            command rm -f -- "$output" 2>/dev/null
+            echo "encryption failed: $target" >&2
+            return 1
+        fi
+
+        command chmod 600 "$output" 2>/dev/null
+        echo "$target -> $output"
+        return
+    fi
+
+    # --- Directory path ------------------------------------------------------
+    [[ -d "$target" && ! -L "$target" ]] || {
+        echo "no such regular file or directory: $2" >&2
         return 1
     }
 
-    local output="${file}.age"
+    _require_cmd zip || return 1
+    _require_cmd mktemp || return 1
+
+    local parent="${target:h:A}"
+    local base="${target:t}"
+
+    [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || {
+        echo "cannot encrypt: $2" >&2
+        return 1
+    }
+
+    local output="${parent}/${base}.zip.age"
 
     if _path_exists "$output"; then
         echo "refusing to overwrite existing: $output" >&2
         return 1
     fi
 
+    # The plaintext archive is created in the local temporary directory, not
+    # next to the destination. On SMB mounts 'rm -rf' can return success
+    # without actually unlinking, so an archive staged on the share would be
+    # left behind — an unencrypted copy of the entire source tree. TMPDIR is
+    # local, private, and honours removal. mktemp -d gives mode 0700
+    # regardless of umask, so the plaintext is never readable by other users
+    # while it exists. The trailing slash is stripped from TMPDIR because
+    # macOS sets it with one, which would produce a double-slash in the path.
+    local archive_dir
+    archive_dir="$(command mktemp -d "${${TMPDIR:-/tmp}%/}/ageto.zip.tmp.XXXXXXXXXX")" || {
+        echo "could not create temporary directory in: ${TMPDIR:-/tmp}" >&2
+        return 1
+    }
+
+    # Cleanup is via the EXIT trap only: in zsh a function's EXIT trap also
+    # fires when a signal interrupts it, and re-raising at $$ would kill this
+    # interactive shell. The path is expanded and quoted NOW, at trap-set
+    # time, rather than left as a live reference: zsh pops the function's
+    # local scope before running the EXIT trap, so a '$archive_dir' inside
+    # single quotes would expand to nothing and clean up nothing at all.
+    trap "command rm -rf -- ${(q)archive_dir} 2>/dev/null \
+        || echo 'warning: plaintext archive may remain: ${archive_dir}' >&2" EXIT
+
+    local archive="${archive_dir}/${base}.zip"
+
+    _archive_dir "$target" "$archive" || return 1
+    command chmod 600 "$archive" 2>/dev/null
+
     echo "recipient: $fingerprint"
 
     # noclobber makes the redirection an O_EXCL create, so nothing is
     # overwritten even if the output appears between the check and here.
     setopt localoptions noclobber
-    if ! command age "${armor[@]}" -r "$key" < "$file" > "$output"; then
+    if ! command age "${armor[@]}" -r "$key" < "$archive" > "$output"; then
         command rm -f -- "$output" 2>/dev/null
-        echo "encryption failed: $file" >&2
+        echo "encryption failed: $2" >&2
         return 1
     fi
 
     command chmod 600 "$output" 2>/dev/null
-    echo "$file -> $output"
+
+    # The ciphertext is committed; remove the plaintext archive immediately
+    # rather than waiting for the trap, and disarm the trap once it is gone.
+    if command rm -rf -- "$archive_dir" 2>/dev/null; then
+        trap - EXIT
+    else
+        echo "warning: ciphertext written, but plaintext archive remains: $archive_dir" >&2
+    fi
+
+    echo "$2 -> $output"
 }
 
 # decrypt <file>

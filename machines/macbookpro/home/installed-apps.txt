@@ -8,6 +8,8 @@ Arq
 ArtCraft Launcher
 Audio Hijack
 AWDL Toggle
+Better Dock
+BitMuse
 Bitwarden
 CADCraft
 Caldera Amp

@@ -91,7 +91,7 @@ cask "android-platform-tools"
 cask "arq"
 # Records audio from any application
 cask "audio-hijack"
-# Desktop password and login vault
+# Open source desktop password manager with encrypted vault and autofilling
 cask "bitwarden"
 # Managed desktop virtualization solution
 cask "citrix-workspace"
